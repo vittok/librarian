@@ -141,6 +141,7 @@ class Library:
         self.db_path = self.data_dir / 'library.sqlite3'
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='bookroom')
         self.lock = threading.Lock(); self.metadata_lock = threading.Lock(); self.last_lookup = 0
+        self.converter_error = ''
         self.converter = os.environ.get('BOOKROOM_CONVERTER') or shutil.which('ebook-convert')
         with self.db() as db:
             db.executescript('''
@@ -203,7 +204,7 @@ class Library:
             formats = [dict(r) for r in db.execute('SELECT format,COUNT(*) AS count FROM books GROUP BY format ORDER BY count DESC')]
             duplicates = db.execute('SELECT COALESCE(SUM(c-1),0) FROM (SELECT COUNT(*) c FROM books GROUP BY sha256 HAVING c>1)').fetchone()[0]
             roots = [dict(r) for r in db.execute('SELECT * FROM roots ORDER BY scanned DESC')]
-        return dict(count=count,size=size,indexed=indexed,duplicates=duplicates,formats=formats,roots=roots,converter=bool(self.converter),outputs=OUTPUTS,data_dir=str(self.data_dir))
+        return dict(count=count,size=size,indexed=indexed,duplicates=duplicates,formats=formats,roots=roots,converter=bool(self.converter),converter_error=self.converter_error,outputs=OUTPUTS,data_dir=str(self.data_dir))
 
     def index_file(self, path):
         path = Path(path).resolve()

@@ -20,17 +20,31 @@ python3 run.py --port 8766
 
 You can also install it into a virtual environment with `pip install .` and run `bookroom`.
 
-### Enable conversion
+### Automatic Calibre setup
 
-Install [Calibre](https://calibre-ebook.com/download), which provides `ebook-convert`, then restart Bookroom. Verify the command is available with `ebook-convert --version` in your terminal. Bookroom disables Convert and displays setup guidance when the converter is unavailable.
+On startup, Bookroom checks your saved converter, PATH, standard installation locations, and its own managed runtime. If a working `ebook-convert` is missing, it automatically downloads and installs [Calibre](https://calibre-ebook.com/download) before opening the browser. The first launch needs internet access, several minutes, and roughly 1 GB of available disk space (temporary downloads may need additional space). Subsequent launches reuse the converter without downloading it again. Existing working installations are not upgraded or replaced.
 
-If Calibre is not on PATH, point Bookroom at the **executable**, not its installation directory:
+The private runtime is stored under `<data-dir>/runtime/calibre`; system packages and PATH are not changed and administrator access is not requested:
+
+- **Linux** uses Calibre's [official isolated installer](https://calibre-ebook.com/download_linux), which verifies its downloaded archive. Required native libraries must already be installed; the setup log explains missing libraries.
+- **Windows** uses the [official portable installer's automated destination argument](https://calibre-ebook.com/download_portable), with the download's SHA-512 checksum checked against Calibre's published checksum before it runs. Checksum requests validate TLS against the public Calibre CA distributed in its official Linux installer; this trust is scoped to the checksum connection and does not change system trust.
+- **macOS** checks the official DMG's SHA-512 checksum, mounts it read-only, copies `calibre.app` into the private runtime, and detaches the image. Normal macOS security checks remain enabled. Current Calibre releases require a compatible macOS version.
+
+The terminal reports setup progress, with installer output in `<data-dir>/calibre-install.log`. If setup fails (for example, while offline or missing native libraries), Bookroom still opens for indexing and organization, displays the reason conversion is unavailable, and retries on the next startup. Concurrent starts share an OS installation lock. New runtimes are validated before replacing an incomplete managed runtime; previous runtimes are retained until that replacement succeeds.
+
+To skip automatic installation, for example for offline catalogue use:
+
+```bash
+python3 run.py --no-install-calibre
+```
+
+You can still install Calibre yourself or explicitly choose its **executable**, not the installation directory:
 
 ```bash
 python3 run.py --converter /opt/calibre/ebook-convert
 ```
 
-On macOS the executable is commonly `/Applications/calibre.app/Contents/MacOS/ebook-convert`. On Windows it is commonly `C:\Program Files\Calibre2\ebook-convert.exe`. You may also set the `BOOKROOM_CONVERTER` environment variable. The `--converter` option is remembered in the selected catalogue's settings for later starts.
+On macOS the executable is commonly `/Applications/calibre.app/Contents/MacOS/ebook-convert`. On Windows it is commonly `C:\Program Files\Calibre2\ebook-convert.exe`. You may also set `BOOKROOM_CONVERTER`. Explicit paths must run successfully; invalid overrides produce a clear startup error. The converter path is remembered in the selected catalogue's settings for later starts.
 
 PDF text indexing uses `pdftotext` if available. Alternatively, install the optional Python reader:
 
@@ -84,7 +98,7 @@ Choose a separate catalogue if needed:
 python3 run.py --data-dir /path/to/my-catalogue
 ```
 
-`BOOKROOM_DATA_DIR` also sets the default. Bookroom listens only on `127.0.0.1`, checks Host and Origin, and requires a random session token on API requests. It is a single-user local app; it is not intended to be exposed to a network. Normal library operations work offline; metadata searches require internet access. No external fonts, analytics, or cover-image services are loaded.
+`BOOKROOM_DATA_DIR` also sets the default. Bookroom listens only on `127.0.0.1`, checks Host and Origin, and requires a random session token on API requests. It is a single-user local app; it is not intended to be exposed to a network. After initial Calibre setup, normal library operations work offline; metadata searches and first-time Calibre downloads require internet access. No external fonts, analytics, or cover-image services are loaded.
 
 Missing source files remain in the catalogue until restored or moved through Bookroom. Batch operations report missing files rather than removing catalogue entries silently. On startup, unfinished jobs are marked interrupted and are not replayed automatically. Activity shows the latest 30 jobs. Metadata lookup requests are spaced at least 1.1 seconds apart and time out after 25 seconds. Closing the metadata dialog stops further requests after the current one finishes.
 
@@ -95,7 +109,7 @@ python3 -m pip install '.[dev]'
 python3 -m pytest -q
 ```
 
-Tests use temporary books and directories. They cover text/EPUB extraction, FTS search and duplicate hashes, metadata preservation, batch previews, file collisions, source-change protection, moving and organization, conversion failure isolation, metadata response handling, and local HTTP authentication. Converter unit tests use a substitute executable, so they do not replace a real Calibre smoke test.
+Tests use temporary books and directories. They cover text/EPUB extraction, FTS search and duplicate hashes, metadata preservation, batch previews, file collisions, source-change protection, moving and organization, conversion failure isolation, metadata response handling, and local HTTP authentication. Installer unit tests cover detection, platform commands, download verification, failed installs, restart reuse, and concurrent starts without downloading software. Set `BOOKROOM_CONVERTER=/path/to/ebook-convert` when running pytest to also run the real five-format conversion smoke test. The Linux first-run installer has been exercised separately with the official download; Windows and macOS installer commands are covered by unit tests and still need native OS smoke testing.
 
 The UI is plain local HTML/CSS/JavaScript with no frontend build step. The backend uses Python's HTTP server, SQLite FTS5, and a single-worker job queue. SQLite must include FTS5, as it does in standard Python distributions on common desktop systems.
 

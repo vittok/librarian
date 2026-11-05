@@ -11,6 +11,7 @@ import urllib.parse
 import webbrowser
 
 from .core import Library
+from .calibre import prepare_converter
 
 STATIC = Path(__file__).parent/'static'
 
@@ -96,24 +97,18 @@ def main():
     parser.add_argument('--data-dir',type=Path,default=Path(os.environ.get('BOOKROOM_DATA_DIR',Path.home()/'.local'/'share'/'bookroom')))
     parser.add_argument('--no-browser',action='store_true')
     parser.add_argument('--converter',type=Path,help='Path to Calibre ebook-convert; remembered for this catalogue')
+    parser.add_argument('--no-install-calibre',action='store_true',help='Skip automatic Calibre installation (offline catalogue mode)')
     args = parser.parse_args()
-    settings_path = args.data_dir.expanduser() / 'settings.json'
-    if args.converter:
-        candidate = args.converter.expanduser().resolve()
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
-            parser.exit(1, f'Converter is not an executable file: {candidate}\n')
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps({'converter':str(candidate)}))
-    elif not os.environ.get('BOOKROOM_CONVERTER') and settings_path.is_file():
-        try:
-            candidate = json.loads(settings_path.read_text()).get('converter','')
-            if candidate and Path(candidate).is_file():
-                os.environ['BOOKROOM_CONVERTER'] = candidate
-        except (ValueError,OSError):
-            pass
-    if args.converter:
-        os.environ['BOOKROOM_CONVERTER'] = str(candidate)
+    try:
+        converter = prepare_converter(
+            args.data_dir, explicit=args.converter or os.environ.get('BOOKROOM_CONVERTER'),
+            auto_install=not args.no_install_calibre,
+            report=lambda message: print(message, flush=True))
+    except ValueError as e:
+        parser.exit(1, str(e)+'\n')
     library = Library(args.data_dir.expanduser())
+    library.converter = converter.path
+    library.converter_error = converter.error
     try: server = make_server(library,args.port)
     except OSError as e:
         library.close(); parser.exit(1,f'Could not start Bookroom: {e}. Try --port 8766.\n')

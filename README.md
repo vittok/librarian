@@ -54,13 +54,32 @@ python3 -m pip install '.[pdf]'
 
 ## Use your library
 
-1. **Import folder**: type a path or use Browse. Scans include nested folders. Importing indexes files in place without copying or moving them. Click an imported folder in the sidebar to scan it again after adding or changing books. These are manual scans, not filesystem watchers.
+1. **Import folder**: type a local path, connected network location, or use Browse. The folder browser includes connected network share and mounted-volume shortcuts. Scans include nested folders. Importing indexes files in place without copying or moving them. Click an imported folder in the sidebar to scan it again after adding or changing books. These are manual scans, not filesystem watchers.
 2. **Search**: enter words from titles, authors, or extracted book text. Matching is case and accent insensitive; all words must match, and the final letters of each word can match a longer word. Filter by format. Results are sorted by title and paginated at 60 per page.
 3. **Duplicates**: shows files with identical SHA-256 content hashes. This detects identical files, rather than different editions or formats of the same work. Bookroom never automatically deletes duplicates.
 4. **Edit details**: click a book title or its ellipsis button to edit the catalogue title, author, and first-publication year.
 5. **Find metadata**: select up to 50 books and fetch candidate matches from Open Library. Choose a match and click Apply for each book. No match is applied automatically. Failed lookups leave existing metadata intact. Online lookups send the title and optional author to Open Library; book contents and paths are not sent. Work-level results may combine multiple editions and languages, so review carefully.
 6. **Batch operations**: select books, then choose Convert, Copy, Move, or Organize. Selection persists across result pages until cleared. A batch accepts up to 1,000 selected files. Choose a destination and preview every resulting path before running it. Previews expire after 15 minutes and can only be executed once.
 7. **Activity**: see queue progress, individual file outcomes, errors, and timestamps. Jobs run sequentially in a background thread while the interface remains usable.
+
+### Import network folders
+
+Network folders work through your operating system's filesystem access. Connect the share and sign in using Explorer, Finder, or your Linux file manager first, then enter its location in **Import folder** or **Browse**:
+
+| Location | Example | Support |
+| --- | --- | --- |
+| Windows UNC | `\\server\Books\Fiction` | Direct on Windows using your Windows session; maps to an already mounted SMB share on Linux/macOS. |
+| SMB URL | `smb://server/Books/Fiction` | Translated to UNC on Windows, or resolved to a connected SMB mount on Linux/macOS. `cifs://` also works. |
+| File URL | `file://server/Books/Fiction` | Remote share handling as above; `file:///mnt/books` and other local file URLs also work. |
+| Mapped network drive | `Z:\Books` | Windows mapped drives visible to the account running Bookroom. |
+| Mounted SMB/NFS/SFTP folder | `/mnt/books`, `/media/books`, `/Volumes/Books` | Use the native mount path. |
+| GNOME network folder | `smb://server/Books` | Resolves connected GVfs/FUSE shares exposed under `/run/user/<uid>/gvfs` or `~/.gvfs`. |
+
+On macOS, use **Finder → Go → Connect to Server** to connect an SMB share. On Linux, a share opened in the file manager must also be exposed to regular filesystem applications through GVfs/FUSE (often provided by `gvfs-fuse`), or mounted to a local directory. Bookroom discovers CIFS/SMB mounts and connected GNOME shares on Linux, and SMB mounts on macOS. Other mounted protocols can be opened using their native paths. It does not scan the LAN for servers, mount shares, or manage network passwords. URLs containing credentials are rejected; use your operating system's authentication instead. IPv6 servers or custom SMB ports can be used through a mounted native folder path.
+
+For names containing spaces or special characters, paste a normal UNC/native path or use URL encoding in URLs, such as `smb://server/Book%20shelf/Science%20%231`. Importing reads books in place. Rescans remember the logical SMB location so they can resolve a reconnected share again. If a share is offline or permissions are missing, the UI or Activity log explains the failure and previously indexed books remain searchable. Scan checks run in the background. Network delays are subject to the operating system's filesystem timeouts.
+
+Batch destinations accept the same locations. Copying, moving, organizing, and conversion outputs require write access to the destination. Network destinations are resolved again before each file is processed; a disconnected or changed SMB mount causes that operation to fail rather than silently switching to another path. Keep the SQLite catalogue in a **local** data directory; only the book folders should live on network storage.
 
 ### Operations
 
@@ -109,7 +128,7 @@ python3 -m pip install '.[dev]'
 python3 -m pytest -q
 ```
 
-Tests use temporary books and directories. They cover text/EPUB extraction, FTS search and duplicate hashes, metadata preservation, batch previews, file collisions, source-change protection, moving and organization, conversion failure isolation, metadata response handling, and local HTTP authentication. Installer unit tests cover detection, platform commands, download verification, failed installs, restart reuse, and concurrent starts without downloading software. Set `BOOKROOM_CONVERTER=/path/to/ebook-convert` when running pytest to also run the real five-format conversion smoke test. The Linux first-run installer has been exercised separately with the official download; Windows and macOS installer commands are covered by unit tests and still need native OS smoke testing.
+Tests use temporary books and directories. They cover text/EPUB extraction, FTS search and duplicate hashes, metadata preservation, batch previews, file collisions, source-change protection, moving and organization, conversion failure isolation, metadata response handling, local HTTP authentication, network URL/UNC parsing, connected-share browsing, network imports and disconnect recovery, and migration of existing catalogue folders. Installer unit tests cover detection, platform commands, download verification, failed installs, restart reuse, and concurrent starts without downloading software. Set `BOOKROOM_CONVERTER=/path/to/ebook-convert` when running pytest to also run the real five-format conversion smoke test. The Linux first-run installer has been exercised separately with the official download; Windows and macOS installer commands are covered by unit tests and still need native OS smoke testing.
 
 The UI is plain local HTML/CSS/JavaScript with no frontend build step. The backend uses Python's HTTP server, SQLite FTS5, and a single-worker job queue. SQLite must include FTS5, as it does in standard Python distributions on common desktop systems.
 

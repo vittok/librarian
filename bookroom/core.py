@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from html.parser import HTMLParser
 
+from .locations import directory, resolve_location
+
 INPUTS = set('azw azw3 azw4 cbz cbr cb7 cbc chm djvu docx epub fb2 fbz html htm htmlz kepub lit lrf mobi odt pdf prc pdb pml rb rtf snb tcr txt txtz'.split())
 OUTPUTS = 'epub pdf azw3 mobi docx txt fb2 rtf htmlz kepub lit lrf pdb pmlz rb snb tcr txtz zip'.split()
 TEXT_LIMIT = 2_000_000
@@ -164,6 +166,8 @@ class Library:
                 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, data TEXT, created REAL);
                 CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY, scanned REAL);
             ''')
+            if 'location' not in {row[1] for row in db.execute('PRAGMA table_info(roots)')}:
+                db.execute("ALTER TABLE roots ADD COLUMN location TEXT DEFAULT ''")
             db.execute("UPDATE jobs SET status='interrupted' WHERE status IN ('queued','running')")
 
     @contextmanager
@@ -279,10 +283,11 @@ class Library:
         return [{**dict(r),'log':json.loads(r['log'])} for r in rows]
 
     def scan(self, folder):
-        if not str(folder).strip(): raise ValueError('Choose a folder to scan')
-        root = Path(folder).expanduser().resolve()
-        if not root.is_dir(): raise ValueError('Choose an existing folder on the computer running Bookroom')
+        location = resolve_location(folder)
         def task(jid):
+            # Network checks run in the worker so import returns a queued job
+            # without waiting for the OS to contact a slow/disconnected share.
+            root = directory(location).resolve()
             paths = []; walk_errors = []
             def onerror(e): walk_errors.append(str(e))
             for parent, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
@@ -290,12 +295,15 @@ class Library:
                 for name in files:
                     p = Path(parent)/name
                     if not p.is_symlink() and p.suffix.lower()[1:] in INPUTS: paths.append(p)
+            if walk_errors and not paths:
+                raise ValueError('Cannot scan folder. Reconnect the network share and check read permissions. '+walk_errors[0])
             with self.db() as db: db.execute('UPDATE jobs SET total=? WHERE id=?',(len(paths),jid))
-            for error in walk_errors: self.progress(jid,error,True,False)
+            for error in walk_errors: self.progress(jid,'Folder unavailable; reconnect the share or check read permissions: '+error,True,False)
             for path in paths:
                 try: self.index_file(path); self.progress(jid, f'Indexed {path}')
                 except Exception as e: self.progress(jid,f'{path}: {e}',True)
-            with self.db() as db: db.execute('INSERT OR REPLACE INTO roots VALUES(?,?)',(str(root),time.time()))
+            with self.db() as db:
+                db.execute('INSERT OR REPLACE INTO roots(path,scanned,location) VALUES(?,?,?)',(str(root),time.time(),location.uri or str(root)))
         return self.enqueue('Scan folder',0,task)
 
     def plan(self, values):
@@ -305,7 +313,10 @@ class Library:
         if not ids or len(ids)>1000 or any(type(i) is not int for i in ids): raise ValueError('Select between 1 and 1,000 books')
         folder = str(values.get('destination','')).strip()
         if not folder: raise ValueError('Choose a destination folder')
-        destination = Path(folder).expanduser().resolve()
+        destination_location = resolve_location(folder)
+        if destination_location.boundary:
+            directory(resolve_location(str(destination_location.boundary)))
+        destination = destination_location.path.resolve()
         if destination.exists() and not destination.is_dir(): raise ValueError('Destination must be a folder')
         formats = list(dict.fromkeys(values.get('formats',[])))
         if kind=='convert':
@@ -331,7 +342,7 @@ class Library:
                 entries.append(dict(id=bid,source=str(src),target=str(output),signature=sig,sha256=book['sha256'],title=book['title'],author=book['author'],format=fmt))
         if not entries: raise ValueError('The selected files already use the chosen output formats')
         pid = uuid.uuid4().hex
-        data = {'kind':kind,'entries':entries,'organize_mode':'copy' if values.get('organize_mode')!='move' else 'move'}
+        data = {'kind':kind,'entries':entries,'destination_location':destination_location.value,'destination_path':str(destination),'organize_mode':'copy' if values.get('organize_mode')!='move' else 'move'}
         with self.db() as db:
             db.execute('DELETE FROM plans WHERE created<?',(time.time()-900,))
             db.execute('INSERT INTO plans VALUES(?,?,?)',(pid,json.dumps(data),time.time()))
@@ -353,6 +364,11 @@ class Library:
 
     def perform(self, plan, entry):
         source = Path(entry['source']); target = Path(entry['target'])
+        if plan.get('destination_location'):
+            fresh = resolve_location(plan['destination_location'])
+            if fresh.path.resolve() != Path(plan['destination_path']):
+                raise ValueError('Network mount changed since preview; create a new preview')
+            if fresh.boundary: directory(resolve_location(str(fresh.boundary)))
         current = self.get(entry['id'])
         if current['path']!=str(source) or current['title']!=entry['title'] or current['author']!=entry['author']:
             raise ValueError('Book changed since preview; create a new preview')

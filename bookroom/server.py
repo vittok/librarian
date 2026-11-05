@@ -12,6 +12,7 @@ import webbrowser
 
 from .core import Library
 from .calibre import prepare_converter
+from .locations import folder_locations, list_folders
 
 STATIC = Path(__file__).parent/'static'
 
@@ -53,11 +54,8 @@ def make_server(library, port=8765):
                     if route=='/api/stats': return self.reply(200,library.stats())
                     if route=='/api/books': return self.reply(200,library.catalogue(arg('q'),arg('format'),arg('duplicates')=='1',int(arg('page','1'))))
                     if route=='/api/jobs': return self.reply(200,library.jobs())
-                    if route=='/api/folders':
-                        folder = Path(arg('path') or str(Path.home())).expanduser().resolve()
-                        if not folder.is_dir(): raise ValueError('Folder does not exist')
-                        children = sorted((p for p in folder.iterdir() if p.is_dir() and not p.name.startswith('.') and not p.is_symlink()),key=lambda p:p.name.casefold())
-                        return self.reply(200,dict(path=str(folder),parent=str(folder.parent),children=[dict(name=p.name,path=str(p)) for p in children][:2000]))
+                    if route=='/api/folder-locations': return self.reply(200,folder_locations())
+                    if route=='/api/folders': return self.reply(200,list_folders(arg('path')))
                     if route=='/':
                         raw = (STATIC/'index.html').read_bytes().replace(b'__SESSION_TOKEN__',token.encode())
                         return self.reply(200,raw,'text/html; charset=utf-8')

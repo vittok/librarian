@@ -2,23 +2,90 @@
 
 A local Python app for bringing scattered ebooks into one searchable catalogue, reviewing online metadata, converting formats, and safely organizing files in batches. The interface runs in your browser; the application and catalogue run on your computer.
 
-## Start
+## Quick install
 
-Python 3.11 or newer is required. The application itself has **no required Python dependencies**.
+### Linux and macOS
 
-From this folder:
+Install **Python 3.11+ with venv support** and **curl**, then run:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/vittok/librarian/main/install.sh | sh
+```
+
+Start the installed app:
+
+```bash
+~/.local/bin/bookroom
+```
+
+Or install **and launch immediately** in one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vittok/librarian/main/install.sh | sh -s -- --run
+```
+
+The app opens [http://127.0.0.1:8765](http://127.0.0.1:8765) in your browser. Keep its terminal open; press Ctrl+C to stop. Calibre is detected or installed automatically on the first launch, which can take several minutes and requires additional disk space. The installer also includes the optional PDF reader by default. If the Python installation omits `ensurepip`, it bootstraps pip from the official PyPA distribution **inside the private environment only**.
+
+The installer uses a private virtual environment under `~/.local/share/bookroom-app/releases/` and creates `~/.local/bin/bookroom`. No `sudo`, Git checkout, or system Python package changes are needed. If `~/.local/bin` is already on PATH, you can simply run `bookroom`. Otherwise use the full path above, or add `~/.local/bin` to PATH yourself.
+
+### Windows (PowerShell)
+
+With Python 3.11+ installed, use the standalone Python installer:
+
+```powershell
+curl.exe -fL https://raw.githubusercontent.com/vittok/librarian/main/install.py -o install-bookroom.py
+py -3 .\install-bookroom.py --run
+```
+
+For later launches:
+
+```powershell
+& "$env:LOCALAPPDATA\Bookroom\bin\bookroom.cmd"
+```
+
+The default Windows application directory is `%LOCALAPPDATA%\Bookroom\app`, with a launcher under `%LOCALAPPDATA%\Bookroom\bin`. Windows installer/launcher generation has unit coverage; the complete curl installation flow has been exercised on Linux, with native Windows/macOS smoke testing still outstanding.
+
+### Installer options
+
+Options are passed after `sh -s --`:
+
+```bash
+# Choose app and launcher locations.
+curl -fsSL https://raw.githubusercontent.com/vittok/librarian/main/install.sh | sh -s -- \
+  --prefix "$HOME/apps/bookroom" --bin-dir "$HOME/bin"
+
+# Choose a branch, tag, or full immutable commit SHA.
+curl -fsSL https://raw.githubusercontent.com/vittok/librarian/main/install.sh | sh -s -- --ref main
+
+# Skip the optional pypdf package.
+curl -fsSL https://raw.githubusercontent.com/vittok/librarian/main/install.sh | sh -s -- --no-pdf
+
+# Launch with app arguments: everything after the second -- goes to Bookroom.
+curl -fsSL https://raw.githubusercontent.com/vittok/librarian/main/install.sh | sh -s -- \
+  --run -- --port 8766 --no-browser
+```
+
+Use `BOOKROOM_PYTHON=/path/to/python3 sh install.sh` when running a downloaded shell installer to choose a specific Python interpreter. The Python installer also supports `--help`. On Debian/Ubuntu, a missing `venv` module is typically resolved by installing `python3-venv` using your normal system package manager; the installer reports the problem without attempting privileged package changes.
+
+### Update or remove an installation
+
+Run the same installer command again to install the latest app. Use the same custom `--prefix` and `--bin-dir` if you chose them previously. A branch/tag is resolved to a commit before downloading, and the installed commit is recorded in `<prefix>/.bookroom-install.json`.
+
+Each update is built and checked in a new release directory before the launcher is switched. If setup fails, the existing launcher continues to use its working release. Successful earlier releases are retained so an already-running app can continue using its own files; **restart Bookroom to use the update**. Stop the app before manually removing old release directories. The installer refuses to overwrite unrelated commands or nonempty unmanaged app directories.
+
+To uninstall, stop Bookroom, remove the generated `bookroom`/`bookroom.cmd` launcher, then remove the app install directory you selected. Catalogue data and the managed Calibre runtime are stored separately under the app's data directory (by default `~/.local/share/bookroom`) and are preserved. Remove that data separately only if you want to erase your catalogue and metadata history. Book files in imported folders are not part of the application install tree.
+
+## Run from a checkout
+
+The application itself has no required Python packages. Python 3.11+ can run it directly from a downloaded or cloned repository:
+
+```bash
+git clone https://github.com/vittok/librarian.git
+cd librarian
 python3 run.py
 ```
 
-On Windows, use `py run.py`. Bookroom opens [http://127.0.0.1:8765](http://127.0.0.1:8765). Keep the terminal open while using it; press Ctrl+C to stop. Queued jobs finish before shutdown. To use a different port:
-
-```bash
-python3 run.py --port 8766
-```
-
-You can also install it into a virtual environment with `pip install .` and run `bookroom`.
+On Windows, use `py -3 run.py`. To use a different port, add `--port 8766`. You can also create your own virtual environment, run `pip install '.[pdf]'`, and use its `bookroom` command. To install from an existing checkout through the bootstrap installer, run `python3 install.py`; it downloads the selected GitHub ref rather than installing uncommitted local files.
 
 ### Automatic Calibre setup
 
@@ -145,3 +212,5 @@ Tests use temporary books and directories. They cover text/EPUB extraction, FTS 
 The UI is plain local HTML/CSS/JavaScript with no frontend build step. The backend uses Python's HTTP server, SQLite FTS5, and a single-worker job queue. SQLite must include FTS5, as it does in standard Python distributions on common desktop systems.
 
 Online metadata API documentation: [Open Library Search API](https://openlibrary.org/dev/docs/api/search).
+
+The curl installer has separate tests for archive extraction boundaries, refusing unrelated paths, argument forwarding, retained releases, failed-update recovery, and launcher quoting. Run these with `python3 -m pytest -q tests/test_installer.py`.

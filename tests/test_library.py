@@ -188,3 +188,6 @@ def test_optional_real_calibre_smoke(library,tmp_path):
     assert title=='A Little Atlas' and author=='Example Author'
     assert 'cartography' in body
     assert library.stats()['count']==6
+    from bookroom.metadata import inspect_book
+    identified=inspect_book(output/'A Little Atlas.mobi',extract(output/'A Little Atlas.mobi'),converter)
+    assert identified['title']=='A Little Atlas' and identified['author']=='Example Author'

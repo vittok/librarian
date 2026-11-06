@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from html.parser import HTMLParser
 
 from .locations import directory, resolve_location
+from .metadata import inspect_book, choose_match, normalized, valid_isbn, isbn13
 
 INPUTS = set('azw azw3 azw4 cbz cbr cb7 cbc chm djvu docx epub fb2 fbz html htm htmlz kepub lit lrf mobi odt pdf prc pdb pml rb rtf snb tcr txt txtz'.split())
 OUTPUTS = 'epub pdf azw3 mobi docx txt fb2 rtf htmlz kepub lit lrf pdb pmlz rb snb tcr txtz zip'.split()
@@ -32,20 +33,23 @@ class TextHTML(HTMLParser):
     def __init__(self):
         super().__init__(); self.parts = []; self.hidden = 0
     def handle_starttag(self, tag, attrs):
+        if tag in ('p','div','h1','h2','h3','br','section','title'): self.parts.append('\n')
         if tag in ('script', 'style'): self.hidden += 1
     def handle_endtag(self, tag):
         if tag in ('script', 'style'): self.hidden = max(0, self.hidden - 1)
+        if tag in ('p','div','h1','h2','h3','section','title'): self.parts.append('\n')
     def handle_data(self, data):
         if not self.hidden: self.parts.append(data)
 
 
 def plain_html(raw):
-    p = TextHTML(); p.feed(raw); return ' '.join(p.parts)
+    p = TextHTML(); p.feed(raw); return ''.join(p.parts)
 
 
 def xml_text(raw):
     root = ET.fromstring(raw)
-    return ' '.join(root.itertext())
+    paragraphs=[e for e in root.iter() if e.tag.rsplit('}',1)[-1] in {'p','h'}]
+    return '\n'.join(''.join(e.itertext()) for e in paragraphs) if paragraphs else ' '.join(root.itertext())
 
 
 def safe_name(value):
@@ -65,14 +69,14 @@ def signature(path):
     s = path.stat(); return [s.st_size, s.st_mtime_ns]
 
 
-def extract(path):
+def extract(path, text_limit=TEXT_LIMIT, pdf_pages=1000):
     """Bounded extraction. Unsupported/image-only files remain metadata searchable."""
     title = path.stem.replace('_', ' '); author = ''; body = ''; status = 'Metadata only'
     ext = path.suffix.lower()[1:]
     try:
         if ext in {'txt', 'html', 'htm', 'pml'}:
             raw = path.open('rb')
-            with raw: body = raw.read(TEXT_LIMIT * 2).decode('utf-8', errors='replace')
+            with raw: body = raw.read(text_limit * 2).decode('utf-8', errors='replace')
             if ext in {'html', 'htm'}: body = plain_html(body)
         elif ext == 'fb2':
             with path.open('rb') as f: root = ET.fromstring(f.read(16_000_000))
@@ -108,9 +112,9 @@ def extract(path):
                 for name in selected:
                     raw = z.read(name).decode('utf-8', errors='replace')
                     text = raw if name.endswith('.txt') else (xml_text(raw) if name.endswith(('.xml', '.fb2')) else plain_html(raw))
-                    parts.append(text[:TEXT_LIMIT-length]); length += len(parts[-1])
-                    if length >= TEXT_LIMIT: break
-                body = ' '.join(parts)
+                    parts.append(text[:text_limit-length]); length += len(parts[-1])
+                    if length >= text_limit: break
+                body = '\n'.join(parts)
         elif ext == 'pdf':
             try:
                 import pypdf
@@ -118,23 +122,23 @@ def extract(path):
                 meta = reader.metadata
                 if meta: title = meta.title or title; author = meta.author or ''
                 parts = []; length = 0
-                for page in reader.pages[:1000]:
-                    text = (page.extract_text() or '')[:TEXT_LIMIT-length]
+                for page in reader.pages[:pdf_pages]:
+                    text = (page.extract_text() or '')[:text_limit-length]
                     parts.append(text); length += len(text)
-                    if length >= TEXT_LIMIT: break
-                body = ' '.join(parts)
+                    if length >= text_limit: break
+                body = '\n'.join(parts)
             except ImportError:
                 if shutil.which('pdftotext'):
                     with tempfile.TemporaryDirectory() as folder:
                         out = Path(folder) / 'content.txt'
-                        subprocess.run(['pdftotext', '-f', '1', '-l', '1000', str(path), str(out)], check=True, capture_output=True, timeout=90)
-                        with out.open('rb') as f: body = f.read(TEXT_LIMIT*2).decode('utf-8', 'replace')
+                        subprocess.run(['pdftotext', '-f', '1', '-l', str(pdf_pages), str(path), str(out)], check=True, capture_output=True, timeout=90)
+                        with out.open('rb') as f: body = f.read(text_limit*2).decode('utf-8', 'replace')
                 else: status = 'Metadata only: install pypdf or pdftotext for PDF text'
-        if body.strip(): status = 'Text indexed' + (' (truncated)' if len(body) >= TEXT_LIMIT else '')
+        if body.strip(): status = 'Text indexed' + (' (truncated)' if len(body) >= text_limit else '')
         elif ext == 'pdf': status = 'Metadata only: no text extracted; scanned PDFs need OCR'
     except Exception as e:
         status = f'Metadata only: extraction failed ({type(e).__name__})'
-    return title[:1000], author[:1000], body[:TEXT_LIMIT], status
+    return title[:1000], author[:1000], body[:text_limit], status
 
 
 class Library:
@@ -165,10 +169,20 @@ class Library:
                     done INTEGER DEFAULT 0, errors INTEGER DEFAULT 0, log TEXT DEFAULT '[]', created REAL);
                 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, data TEXT, created REAL);
                 CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY, scanned REAL);
+                CREATE TABLE IF NOT EXISTS selections(id TEXT PRIMARY KEY, created REAL);
+                CREATE TABLE IF NOT EXISTS selection_books(selection_id TEXT,book_id INTEGER,PRIMARY KEY(selection_id,book_id));
+                CREATE TABLE IF NOT EXISTS metadata_cache(key TEXT PRIMARY KEY,data TEXT,created REAL);
+                CREATE TABLE IF NOT EXISTS metadata_reviews(book_id INTEGER PRIMARY KEY,evidence TEXT,candidates TEXT,reason TEXT,created REAL);
+                CREATE TABLE IF NOT EXISTS metadata_history(id INTEGER PRIMARY KEY,job_id TEXT,book_id INTEGER,previous TEXT,applied TEXT,undone INTEGER DEFAULT 0,created REAL);
+
             ''')
             if 'location' not in {row[1] for row in db.execute('PRAGMA table_info(roots)')}:
                 db.execute("ALTER TABLE roots ADD COLUMN location TEXT DEFAULT ''")
-            db.execute("UPDATE jobs SET status='interrupted' WHERE status IN ('queued','running')")
+            if 'metadata_origin' not in {row[1] for row in db.execute('PRAGMA table_info(books)')}:
+                db.execute("ALTER TABLE books ADD COLUMN metadata_origin TEXT DEFAULT ''")
+            if 'cancel_requested' not in {row[1] for row in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute('ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER DEFAULT 0')
+            db.execute("UPDATE jobs SET status='interrupted' WHERE status IN ('queued','running','cancelling')")
 
     @contextmanager
     def db(self):
@@ -187,28 +201,36 @@ class Library:
         if not row: raise ValueError('Book no longer exists in catalogue')
         return dict(row)
 
-    def catalogue(self, q='', fmt='', duplicates=False, page=1):
+    def catalogue(self, q='', fmt='', duplicates=False, page=1, selection_id='', review=False):
         page = max(1, int(page)); clauses = []; params = []
         if q.strip():
             words = re.findall(r'\w+', q, flags=re.UNICODE)[:30]
-            if not words: return {'books': [], 'total': 0, 'page': page, 'pages': 1}
-            clauses.append('b.id IN (SELECT rowid FROM search WHERE search MATCH ?)')
-            params.append(' AND '.join('"'+w+'"*' for w in words))
+            if not words: clauses.append('0')
+            else:
+                clauses.append('b.id IN (SELECT rowid FROM search WHERE search MATCH ?)')
+                params.append(' AND '.join('"'+w+'"*' for w in words))
+        if review: clauses.append('b.id IN (SELECT book_id FROM metadata_reviews)')
         if fmt: clauses.append('b.format=?'); params.append(fmt)
         if duplicates: clauses.append('b.sha256 IN (SELECT sha256 FROM books GROUP BY sha256 HAVING COUNT(*)>1)')
         where = ' WHERE '+' AND '.join(clauses) if clauses else ''
+        selected=set();selection_count=0
         with self.db() as db:
+            if selection_id:
+                self._check_selection(db,selection_id)
+                selected={r[0] for r in db.execute('SELECT s.book_id FROM selection_books s JOIN books b ON b.id=s.book_id WHERE selection_id=?',(selection_id,))}
+                selection_count=len(selected)
             total = db.execute('SELECT COUNT(*) FROM books b'+where, params).fetchone()[0]
             rows = db.execute('SELECT b.id,b.path,b.title,b.author,b.format,b.size,b.index_status,b.year,b.source,b.added FROM books b'+where+' ORDER BY b.title COLLATE NOCASE,b.id LIMIT 60 OFFSET ?', (*params,(page-1)*60)).fetchall()
-        return {'books':[dict(r) for r in rows], 'total':total, 'page':page, 'pages':max(1,(total+59)//60)}
+        return {'books':[{**dict(r),'in_selection':r['id'] in selected} for r in rows], 'total':total, 'page':page, 'pages':max(1,(total+59)//60),'selection_count':selection_count}
 
     def stats(self):
         with self.db() as db:
             count, size, indexed = db.execute("SELECT COUNT(*),COALESCE(SUM(size),0),COALESCE(SUM(index_status LIKE 'Text indexed%'),0) FROM books").fetchone()
             formats = [dict(r) for r in db.execute('SELECT format,COUNT(*) AS count FROM books GROUP BY format ORDER BY count DESC')]
             duplicates = db.execute('SELECT COALESCE(SUM(c-1),0) FROM (SELECT COUNT(*) c FROM books GROUP BY sha256 HAVING c>1)').fetchone()[0]
+            review_count=db.execute('SELECT COUNT(*) FROM metadata_reviews r JOIN books b ON b.id=r.book_id').fetchone()[0]
             roots = [dict(r) for r in db.execute('SELECT * FROM roots ORDER BY scanned DESC')]
-        return dict(count=count,size=size,indexed=indexed,duplicates=duplicates,formats=formats,roots=roots,converter=bool(self.converter),converter_error=self.converter_error,outputs=OUTPUTS,data_dir=str(self.data_dir))
+        return dict(count=count,size=size,indexed=indexed,duplicates=duplicates,review_count=review_count,formats=formats,roots=roots,converter=bool(self.converter),converter_error=self.converter_error,outputs=OUTPUTS,data_dir=str(self.data_dir))
 
     def index_file(self, path):
         path = Path(path).resolve()
@@ -236,36 +258,155 @@ class Library:
         source = str(values.get('source',''))[:300]
         if source and not re.fullmatch(r'https://openlibrary\.org/works/OL\d+W', source): source = ''
         with self.db() as db:
-            db.execute('UPDATE books SET title=?,author=?,year=?,source=?,metadata_locked=1 WHERE id=?',(title,author,year,source,book_id))
+            db.execute("UPDATE books SET title=?,author=?,year=?,source=?,metadata_locked=1,metadata_origin='manual' WHERE id=?",(title,author,year,source,book_id))
+            db.execute('DELETE FROM metadata_reviews WHERE book_id=?',(book_id,))
         return {'ok':True}
 
-    def lookup(self, title, author=''):
+    def lookup(self, title='', author='', isbn=''):
+        isbn=valid_isbn(isbn)
+        key=json.dumps([normalized(title),normalized(author),isbn],ensure_ascii=False)
         with self.metadata_lock:
+            with self.db() as db:
+                cached=db.execute('SELECT data FROM metadata_cache WHERE key=? AND created>?',(key,time.time()-7*86400)).fetchone()
+            if cached:return json.loads(cached[0])
             time.sleep(max(0, 1.1 - (time.monotonic() - self.last_lookup)))
             self.last_lookup = time.monotonic()
-            query = {'title': title[:250], 'limit': 8, 'fields': 'key,title,author_name,first_publish_year'}
-            if author: query['author'] = author[:250]
-            url = 'https://openlibrary.org/search.json?' + urllib.parse.urlencode(query)
-            req = urllib.request.Request(url, headers={'User-Agent':'Bookroom/1.0 (local personal library manager)', 'Accept':'application/json'})
+            query = {'limit':8,'fields':'key,title,author_name,first_publish_year'+(',isbn' if isbn else '')}
+            if isbn:query['q']='isbn:'+isbn
+            else:
+                query['title']=title[:250]
+                if author:query['author']=author[:250]
+            url='https://openlibrary.org/search.json?'+urllib.parse.urlencode(query)
+            req=urllib.request.Request(url,headers={'User-Agent':'Bookroom/1.0 (local personal library manager)','Accept':'application/json'})
             try:
-                with urllib.request.urlopen(req, timeout=25) as response: data = json.loads(response.read(2_000_000))
-            except Exception as e: raise ValueError(f'Open Library could not be reached: {e}') from e
-        result = []
-        for item in data.get('docs', []):
-            key = str(item.get('key','')); key = '/works/'+key if key.startswith('OL') else key
-            if not re.fullmatch(r'/works/OL\d+W', key): continue
-            result.append(dict(title=str(item.get('title','')),author='; '.join(item.get('author_name',[])),year=str(item.get('first_publish_year','')),source='https://openlibrary.org'+key))
-        return result
+                with urllib.request.urlopen(req,timeout=25) as response:data=json.loads(response.read(2_000_000))
+            except Exception as e:raise ValueError(f'Open Library could not be reached: {e}') from e
+            result=[]
+            for item in data.get('docs',[]):
+                work=str(item.get('key',''));work='/works/'+work if work.startswith('OL') else work
+                if not re.fullmatch(r'/works/OL\d+W',work):continue
+                result.append(dict(title=str(item.get('title','')),author='; '.join(item.get('author_name',[])),year=str(item.get('first_publish_year','')),source='https://openlibrary.org'+work,isbns=[v for v in item.get('isbn',[]) if valid_isbn(v) and (not isbn or isbn13(v)==isbn13(isbn))][:4]))
+            with self.db() as db:db.execute('INSERT OR REPLACE INTO metadata_cache VALUES(?,?,?)',(key,json.dumps(result),time.time()))
+            return result
+
+    def _check_selection(self, db, selection_id):
+        row=db.execute('SELECT created FROM selections WHERE id=?',(selection_id,)).fetchone()
+        if not row or row[0]<time.time()-86400:raise ValueError('Library selection expired. Select all books again.')
+
+    def create_selection(self):
+        sid=uuid.uuid4().hex
+        with self.db() as db:
+            db.execute('DELETE FROM selection_books WHERE selection_id IN (SELECT id FROM selections WHERE created<?)',(time.time()-86400,))
+            db.execute('DELETE FROM selections WHERE created<?',(time.time()-86400,))
+            db.execute('INSERT INTO selections VALUES(?,?)',(sid,time.time()))
+            db.execute('INSERT INTO selection_books SELECT ?,id FROM books',(sid,))
+            count=db.execute('SELECT COUNT(*) FROM selection_books WHERE selection_id=?',(sid,)).fetchone()[0]
+        return dict(selection_id=sid,count=count)
+
+    def selected_ids(self, values):
+        ids=values.get('ids',[]);excluded=values.get('excluded_ids',[])
+        if not isinstance(ids,list) or not isinstance(excluded,list) or any(type(i) is not int or i<=0 for i in ids+excluded):raise ValueError('Invalid book selection')
+        selected=set()
+        with self.db() as db:
+            sid=values.get('selection_id')
+            if sid:
+                self._check_selection(db,sid)
+                selected={r[0] for r in db.execute('SELECT s.book_id FROM selection_books s JOIN books b ON b.id=s.book_id WHERE selection_id=?',(sid,))}
+            for bid in ids:
+                if not db.execute('SELECT 1 FROM books WHERE id=?',(bid,)).fetchone():raise ValueError('A selected book no longer exists; refresh the library')
+            selected.update(ids);selected.difference_update(excluded)
+        if not selected:raise ValueError('Select at least one book')
+        return sorted(selected)
+
+    def selected_books(self, values):
+        ids=self.selected_ids(values)
+        if len(ids)>50:raise ValueError('Use Auto metadata for more than 50 books; manual review handles up to 50 at once')
+        with self.db() as db:
+            members={r[0] for r in db.execute('SELECT book_id FROM selection_books WHERE selection_id=?',(values.get('selection_id',''),))}
+        return [{**{k:book[k] for k in ('id','title','author','format')},'in_selection':bid in members} for bid in ids for book in [self.get(bid)]]
+
+    def identify_book(self, book_id):
+        book=self.get(book_id);path=Path(book['path'])
+        before=signature(path)
+        if before!=[book['size'],book['mtime']]:raise ValueError('Book changed since indexing; rescan before identifying it')
+        evidence=inspect_book(path,extract(path,text_limit=120000,pdf_pages=12),self.converter)
+        if signature(path)!=before:raise ValueError('Book changed during inspection; rescan it')
+        if not evidence['title'] and not evidence['isbn']:return dict(evidence=evidence,candidates=[],match=None,reason='No usable text or embedded metadata; image-only books need OCR')
+        candidates=self.lookup(evidence['title'],evidence['author'],isbn=evidence['isbn'])
+        if evidence['isbn'] and not candidates:candidates=self.lookup(evidence['title'],evidence['author']) if evidence['title'] else []
+        return dict(evidence=evidence,candidates=candidates,**choose_match(evidence,candidates))
+
+    def automatic_metadata(self, values):
+        ids=self.selected_ids(values)
+        protect=values.get('protect_edits',True) is not False
+        def task(jid):
+            for bid in ids:
+                if self.cancelled(jid):break
+                try:
+                    previous=self.get(bid)
+                    if protect and previous['metadata_locked'] and previous['metadata_origin']!='automatic':
+                        self.progress(jid,f"Preserved edited metadata: {previous['title']}");continue
+                    identified=self.identify_book(bid)
+                    if self.cancelled(jid):break
+                    match=identified['match']
+                    with self.db() as db:
+                        current=dict(db.execute('SELECT * FROM books WHERE id=?',(bid,)).fetchone() or {})
+                        if any(current.get(k)!=previous[k] for k in ('title','author','year','source','metadata_locked','metadata_origin','path','mtime')):raise ValueError('Book changed while checking metadata; retry this book')
+                        if match:
+                            fields=('title','author','year','source','metadata_locked','metadata_origin')
+                            before={k:previous[k] for k in fields}
+                            after={k:match.get(k,'') for k in ('title','author','year','source')};after.update(metadata_locked=1,metadata_origin='automatic')
+                            db.execute('INSERT INTO metadata_history(job_id,book_id,previous,applied,created) VALUES(?,?,?,?,?)',(jid,bid,json.dumps(before),json.dumps(after),time.time()))
+                            db.execute("UPDATE books SET title=?,author=?,year=?,source=?,metadata_locked=1,metadata_origin='automatic' WHERE id=?",(after['title'],after['author'],after['year'],after['source'],bid))
+                            db.execute('DELETE FROM metadata_reviews WHERE book_id=?',(bid,))
+                        else:
+                            db.execute('INSERT OR REPLACE INTO metadata_reviews VALUES(?,?,?,?,?)',(bid,json.dumps(identified['evidence']),json.dumps(identified['candidates']),identified['reason'],time.time()))
+                    message=f"Updated: {previous['title']} → {match['title']} — {match['author']} ({identified['reason']})" if match else f"Review needed: {previous['title']} ({identified['reason']})"
+                    self.progress(jid,message)
+                except Exception as e:self.progress(jid,f'Book {bid}: {e}',True)
+        return self.enqueue('Auto metadata',len(ids),task)
+
+    def cancelled(self, jid):
+        with self.db() as db:return bool(db.execute('SELECT cancel_requested FROM jobs WHERE id=?',(jid,)).fetchone()[0])
+
+    def cancel_job(self, jid):
+        with self.db() as db:
+            row=db.execute('SELECT kind,status FROM jobs WHERE id=?',(jid,)).fetchone()
+            if not row or row['kind']!='Auto metadata':raise ValueError('This job cannot be cancelled here')
+            if row['status'] in ('queued','running','cancelling'):
+                db.execute("UPDATE jobs SET cancel_requested=1,status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END WHERE id=?",(jid,))
+        return {'ok':True}
+
+    def undo_metadata(self, jid):
+        with self.db() as db:
+            job=db.execute('SELECT status FROM jobs WHERE id=?',(jid,)).fetchone()
+            if not job or job['status'] in ('queued','running','cancelling'):raise ValueError('Wait for the metadata job to stop before undoing it')
+            history=[dict(r) for r in db.execute('SELECT * FROM metadata_history WHERE job_id=? AND undone=0 ORDER BY id DESC',(jid,))]
+        if not history:raise ValueError('No automatic changes remain to undo')
+        def task(undo_jid):
+            for change in history:
+                try:
+                    before=json.loads(change['previous']);applied=json.loads(change['applied'])
+                    with self.db() as db:
+                        current=dict(db.execute('SELECT * FROM books WHERE id=?',(change['book_id'],)).fetchone() or {})
+                        if any(current.get(k)!=v for k,v in applied.items()):raise ValueError('Book was edited after this job; kept its newer details')
+                        fields=list(before)
+                        db.execute('UPDATE books SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',(*before.values(),change['book_id']))
+                        db.execute('UPDATE metadata_history SET undone=1 WHERE id=?',(change['id'],))
+                    self.progress(undo_jid,f"Restored: {before['title']}")
+                except Exception as e:self.progress(undo_jid,f"Book {change['book_id']}: {e}",True)
+        return self.enqueue('Undo metadata',len(history),task)
 
     def enqueue(self, kind, total, task):
         jid = uuid.uuid4().hex
         with self.db() as db:
             db.execute('INSERT INTO jobs(id,kind,status,total,created) VALUES(?,?,?,?,?)',(jid,kind,'queued',total,time.time()))
         def run():
+            if self.cancelled(jid):return
             with self.db() as db: db.execute("UPDATE jobs SET status='running' WHERE id=?",(jid,))
             try:
                 task(jid)
-                with self.db() as db: db.execute("UPDATE jobs SET status=CASE WHEN errors>0 THEN 'completed with errors' ELSE 'completed' END WHERE id=?",(jid,))
+                with self.db() as db: db.execute("UPDATE jobs SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN errors>0 THEN 'completed with errors' ELSE 'completed' END WHERE id=?",(jid,))
             except Exception as e:
                 self.progress(jid, str(e), error=True, increment=False)
                 with self.db() as db: db.execute("UPDATE jobs SET status='failed' WHERE id=?",(jid,))
@@ -275,20 +416,21 @@ class Library:
     def progress(self, jid, message, error=False, increment=True):
         with self.db() as db:
             row = db.execute('SELECT log FROM jobs WHERE id=?',(jid,)).fetchone()
-            log = json.loads(row[0]); log.append({'message':message,'error':error,'at':time.time()})
+            log = json.loads(row[0]); log.append({'message':message,'error':error,'at':time.time()});log=log[-1000:]
             db.execute('UPDATE jobs SET done=done+?,errors=errors+?,log=? WHERE id=?',(int(increment),int(error),json.dumps(log),jid))
 
     def jobs(self):
         with self.db() as db: rows = db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT 30').fetchall()
-        return [{**dict(r),'log':json.loads(r['log'])} for r in rows]
+        with self.db() as db: undoable={r[0]:r[1] for r in db.execute('SELECT job_id,COUNT(*) FROM metadata_history WHERE undone=0 GROUP BY job_id')}
+        return [{**dict(r),'log':json.loads(r['log']),'undoable':undoable.get(r['id'],0)} for r in rows]
 
-    def scan(self, folder):
+    def scan(self, folder, auto_metadata=False):
         location = resolve_location(folder)
         def task(jid):
             # Network checks run in the worker so import returns a queued job
             # without waiting for the OS to contact a slow/disconnected share.
             root = directory(location).resolve()
-            paths = []; walk_errors = []
+            paths = []; walk_errors = []; scanned_ids=[]
             def onerror(e): walk_errors.append(str(e))
             for parent, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
                 dirs[:] = [d for d in dirs if not (Path(parent)/d).is_symlink() and (Path(parent)/d).resolve() != self.data_dir]
@@ -300,17 +442,19 @@ class Library:
             with self.db() as db: db.execute('UPDATE jobs SET total=? WHERE id=?',(len(paths),jid))
             for error in walk_errors: self.progress(jid,'Folder unavailable; reconnect the share or check read permissions: '+error,True,False)
             for path in paths:
-                try: self.index_file(path); self.progress(jid, f'Indexed {path}')
+                try: scanned_ids.append(self.index_file(path)); self.progress(jid, f'Indexed {path}')
                 except Exception as e: self.progress(jid,f'{path}: {e}',True)
             with self.db() as db:
                 db.execute('INSERT OR REPLACE INTO roots(path,scanned,location) VALUES(?,?,?)',(str(root),time.time(),location.uri or str(root)))
+            if auto_metadata and scanned_ids:
+                self.automatic_metadata({'ids':scanned_ids,'protect_edits':True})
+                self.progress(jid,f'Queued automatic metadata for {len(scanned_ids)} books',increment=False)
         return self.enqueue('Scan folder',0,task)
 
     def plan(self, values):
         kind = values.get('kind')
         if kind not in {'copy','move','organize','convert'}: raise ValueError('Unknown batch action')
-        ids = list(dict.fromkeys(values.get('ids',[])))
-        if not ids or len(ids)>1000 or any(type(i) is not int for i in ids): raise ValueError('Select between 1 and 1,000 books')
+        ids = self.selected_ids(values)
         folder = str(values.get('destination','')).strip()
         if not folder: raise ValueError('Choose a destination folder')
         destination_location = resolve_location(folder)
@@ -346,7 +490,7 @@ class Library:
         with self.db() as db:
             db.execute('DELETE FROM plans WHERE created<?',(time.time()-900,))
             db.execute('INSERT INTO plans VALUES(?,?,?)',(pid,json.dumps(data),time.time()))
-        return {**data,'plan_id':pid}
+        return {**data,'entries':entries[:200],'total_entries':len(entries),'omitted_entries':max(0,len(entries)-200),'plan_id':pid}
 
     def execute(self, plan_id):
         with self.lock, self.db() as db:

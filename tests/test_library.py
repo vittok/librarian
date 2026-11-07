@@ -191,3 +191,6 @@ def test_optional_real_calibre_smoke(library,tmp_path):
     from bookroom.metadata import inspect_book
     identified=inspect_book(output/'A Little Atlas.mobi',extract(output/'A Little Atlas.mobi'),converter)
     assert identified['title']=='A Little Atlas' and identified['author']=='Example Author'
+    mobi=next(b for b in library.catalogue()['books'] if b['format']=='mobi')
+    preview=library.book_preview(mobi['id'])
+    assert 'cartography' in preview['text'] and preview['has_text']

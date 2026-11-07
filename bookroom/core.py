@@ -23,6 +23,7 @@ from html.parser import HTMLParser
 
 from .locations import directory, resolve_location
 from .metadata import inspect_book, choose_match, normalized, valid_isbn, isbn13
+from .preview import Previews
 
 INPUTS = set('azw azw3 azw4 cbz cbr cb7 cbc chm djvu docx epub fb2 fbz html htm htmlz kepub lit lrf mobi odt pdf prc pdb pml rb rtf snb tcr txt txtz'.split())
 OUTPUTS = 'epub pdf azw3 mobi docx txt fb2 rtf htmlz kepub lit lrf pdb pmlz rb snb tcr txtz zip'.split()
@@ -147,6 +148,7 @@ class Library:
         self.db_path = self.data_dir / 'library.sqlite3'
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='bookroom')
         self.lock = threading.Lock(); self.metadata_lock = threading.Lock(); self.last_lookup = 0
+        self.previews = Previews(extract)
         self.converter_error = ''
         self.converter = os.environ.get('BOOKROOM_CONVERTER') or shutil.which('ebook-convert')
         with self.db() as db:
@@ -200,6 +202,15 @@ class Library:
         with self.db() as db: row = db.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone()
         if not row: raise ValueError('Book no longer exists in catalogue')
         return dict(row)
+
+    def book_preview(self, book_id):
+        book=self.get(book_id)
+        preview=self.previews.opening(Path(book['path']),self.converter)
+        return {**preview,'book':{k:book[k] for k in ('id','title','author','format')},'filename':Path(book['path']).name}
+
+    def preview_page(self, book_id, page):
+        book=self.get(book_id)
+        return self.previews.page(Path(book['path']),page,self.converter)
 
     def catalogue(self, q='', fmt='', duplicates=False, page=1, selection_id='', review=False):
         page = max(1, int(page)); clauses = []; params = []

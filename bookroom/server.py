@@ -53,6 +53,8 @@ def make_server(library, port=8765):
                     def arg(key, default=''): return query.get(key,[default])[0]
                     if route=='/api/stats': return self.reply(200,library.stats())
                     if route=='/api/books': return self.reply(200,library.catalogue(arg('q'),arg('format'),arg('duplicates')=='1',int(arg('page','1')),selection_id=arg('selection_id'),review=arg('review')=='1'))
+                    if route=='/api/book-preview': return self.reply(200,library.book_preview(int(arg('id'))))
+                    if route=='/api/preview-page': return self.reply(200,library.preview_page(int(arg('id')),int(arg('page','1'))))
                     if route=='/api/jobs': return self.reply(200,library.jobs())
                     if route=='/api/folder-locations': return self.reply(200,folder_locations())
                     if route=='/api/folders': return self.reply(200,list_folders(arg('path')))

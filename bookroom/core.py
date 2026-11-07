@@ -362,10 +362,11 @@ class Library:
         if before!=[book['size'],book['mtime']]:raise ValueError('Book changed since indexing; rescan before identifying it')
         evidence=inspect_book(path,extract(path,text_limit=120000,pdf_pages=12),self.converter)
         if signature(path)!=before:raise ValueError('Book changed during inspection; rescan it')
-        if not evidence['title'] and not evidence['isbn']:return dict(evidence=evidence,candidates=[],match=None,reason='No usable text or embedded metadata; image-only books need OCR')
+        if not evidence['title'] and not evidence['isbn']:return dict(evidence=evidence,candidates=[],match=None,score=0,accuracy=0,reason='No usable text or embedded metadata; image-only books need OCR')
         candidates=self.lookup(evidence['title'],evidence['author'],isbn=evidence['isbn'])
         if evidence['isbn'] and not candidates:candidates=self.lookup(evidence['title'],evidence['author']) if evidence['title'] else []
-        return dict(evidence=evidence,candidates=candidates,**choose_match(evidence,candidates))
+        result=choose_match(evidence,candidates)
+        return dict(evidence=evidence,**result)
 
     def automatic_metadata(self, values):
         ids=self.selected_ids(values)

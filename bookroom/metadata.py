@@ -117,10 +117,20 @@ def inspect_book(path,extracted,converter=None):
 
 def title_score(left,right):
     left,right=normalized(left),normalized(right)
+    if not left or not right:return 0
     if left==right:return 1.0
     # Different volume numbers should never be treated as near-identical titles.
     if re.findall(r'\b(?:\d+|i{1,3}|iv|vi{0,3}|ix|x)\b',left)!=re.findall(r'\b(?:\d+|i{1,3}|iv|vi{0,3}|ix|x)\b',right):return 0
-    return SequenceMatcher(None,left,right).ratio()
+    sequence=SequenceMatcher(None,left,right).ratio()
+    a=[v for v in left.split() if v not in {'a','an','the'}]
+    b=[v for v in right.split() if v not in {'a','an','the'}]
+    aset,bset=set(a),set(b)
+    token_dice=2*len(aset&bset)/(len(aset)+len(bset)) if aset and bset else 0
+    # A subtitle or edition phrase may be absent on one source. Requiring at
+    # least two shared words avoids treating single-word series titles as the
+    # same book merely because one contains the other.
+    containment=.94 if min(len(aset),len(bset))>=2 and (aset<=bset or bset<=aset) else 0
+    return min(1,max(sequence,token_dice*.98,containment))
 
 
 def author_score(left,right):
@@ -131,13 +141,49 @@ def author_score(left,right):
         return normalized(value).split()
     a,b=tokens(left),tokens(right)
     if a==b and a:return 1.0
-    if len(a)<2 or len(b)<2 or a[-1]!=b[-1]:return 0
-    first_a,first_b=''.join(a[:-1]),''.join(b[:-1])
-    if first_a==first_b:return .98
-    # Initials may abbreviate names, but two conflicting full first names may not.
-    if a[0]!=b[0] and len(a[0])>1 and len(b[0])>1:return 0
-    if a[0][0]==b[0][0] and (len(a[0])==1 or len(b[0])==1):return .96
+    if len(a)<2 or len(b)<2:return 0
+    last=SequenceMatcher(None,a[-1],b[-1]).ratio()
+    if last<.82:return 0
+    last_factor=1 if a[-1]==b[-1] else .9
+    first_a,first_b=a[0],b[0]
+    if first_a==first_b:return .98*last_factor
+    # Initials, omitted middle names, and shortened given names are common in
+    # catalogues. Conflicting full given names still receive no credit.
+    if first_a[0]==first_b[0] and (len(first_a)==1 or len(first_b)==1):return .96*last_factor
+    if first_a[0]==first_b[0] and min(len(first_a),len(first_b))>=3 and (first_a.startswith(first_b) or first_b.startswith(first_a)):return .93*last_factor
+    if SequenceMatcher(None,first_a,first_b).ratio()>=.78:return .9*last_factor
     return 0
+
+
+def match_score(evidence,candidate):
+    """Return an explainable 0..1 accuracy score for an online candidate."""
+    title=title_score(evidence.get('title',''),candidate.get('title',''))
+    has_author=bool(evidence.get('author'))
+    author=author_score(evidence['author'],candidate.get('author','')) if has_author else 0
+    strength=max(0,min(1,float(evidence.get('strength',0))))
+    exact_isbn=bool(evidence.get('isbn') and isbn13(evidence['isbn']) in {isbn13(v) for v in candidate.get('isbns',[]) if valid_isbn(v)})
+    verified_isbn=exact_isbn and (strength<.85 or title>=.75)
+    if verified_isbn:
+        score=1.0
+    elif strength>=.95 and title==1 and (not has_author or author==1):
+        score=1.0
+    elif has_author:
+        score=.45*strength+.40*title+.15*author
+    else:
+        # When no author was found, its weight moves to title agreement rather
+        # than penalizing otherwise strong embedded/title-page evidence.
+        score=.45*strength+.55*title
+    if not verified_isbn and (title<.70 or (has_author and author==0)):score=min(score,.799)
+    score=max(0,min(1,score))
+    accuracy=int(score*100+1e-9)
+    parts={'contents':round(strength*100),'online_title':round(title*100),'author':round(author*100) if has_author else None,'isbn':verified_isbn}
+    if verified_isbn:reason='100% accuracy: verified ISBN match'
+    elif score==1:reason='100% accuracy: inside-book title and internet title agree exactly'+(' and the author agrees' if has_author else '')
+    else:
+        details=f"inside-book evidence {parts['contents']}%, online title agreement {parts['online_title']}%"
+        if has_author:details+=f", author agreement {parts['author']}%"
+        reason=f'{accuracy}% accuracy: {details}'
+    return score,accuracy,parts,reason
 
 
 def choose_match(evidence,candidates):
@@ -147,15 +193,13 @@ def choose_match(evidence,candidates):
         key=(normalized(candidate['title']),normalized(candidate['author']))
         if key in seen:continue
         seen.add(key)
-        title=title_score(evidence['title'],candidate['title'])
-        author=author_score(evidence['author'],candidate['author']) if evidence['author'] else 0
-        exact_isbn=bool(evidence['isbn'] and isbn13(evidence['isbn']) in {isbn13(v) for v in candidate.get('isbns',[]) if valid_isbn(v)})
-        score=0;reason='Insufficient agreement with book contents'
-        if exact_isbn and (evidence['strength']<.85 or title>=.75):score=1;reason='Verified ISBN match'
-        elif evidence['strength']>=.85 and title>=.94 and author>=.94:score=.98*title;reason='Title and author agree with the book'
-        elif evidence['strength']>=.85 and not evidence['author'] and title==1 and len(normalized(evidence['title']).split())>=3:score=.94;reason='Exact distinctive title from inside the book'
-        ranked.append((score,candidate,reason))
+        score,accuracy,parts,reason=match_score(evidence,candidate)
+        ranked.append((score,{**candidate,'accuracy':accuracy,'score':round(score,4),'score_components':parts,'score_reason':reason},reason))
     ranked.sort(key=lambda v:v[0],reverse=True)
-    if not ranked or ranked[0][0]<.94:return dict(match=None,reason='No confident match; review candidates manually')
-    if len(ranked)>1 and ranked[0][0]-ranked[1][0]<.04:return dict(match=None,reason='Several equally plausible matches; review required')
-    return dict(match=ranked[0][1],reason=ranked[0][2])
+    scored=[v[1] for v in ranked]
+    if not ranked:return dict(match=None,candidates=[],score=0,accuracy=0,reason='No usable internet matches were found')
+    best=ranked[0]
+    if best[0]<.80:return dict(match=None,candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=best[2]+'; below the 80% automatic threshold')
+    if len(ranked)>1 and ranked[1][0]>=.80 and (ranked[1][0]==1 or (best[0]<1 and best[0]-ranked[1][0]<.04)):
+        return dict(match=None,candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=f"{best[1]['accuracy']}% best accuracy, but several candidates are equally plausible; review required")
+    return dict(match=best[1],candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=best[2]+'; applied automatically')

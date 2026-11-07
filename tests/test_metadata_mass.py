@@ -9,7 +9,7 @@ import urllib.request
 import pytest
 
 from bookroom.core import Library,extract,signature
-from bookroom.metadata import inspect_book,title_page,valid_isbn,isbn13,choose_match,author_score
+from bookroom.metadata import inspect_book,title_page,valid_isbn,isbn13,choose_match,author_score,title_score
 from bookroom.server import make_server
 
 
@@ -84,6 +84,38 @@ def test_conflicting_authors_ambiguous_titles_and_volumes_require_review():
     assert choose_match(evidence,[candidate(),candidate(author='Another Author',key='OL2W')])['match'] is None
     evidence.update(title='Collected Tales Volume II',author='Jane Austen')
     assert choose_match(evidence,[candidate(title='Collected Tales Volume III')])['match'] is None
+
+
+def test_accuracy_scoring_handles_spelling_initials_and_shortened_names():
+    evidence=dict(title='The Colour of Magick',author='T. Pratchett',strength=.98,isbn='')
+    result=choose_match(evidence,[candidate(title='The Color of Magic',author='Terry Pratchett')])
+    assert result['match'] and 80<=result['accuracy']<=100
+    assert result['candidates'][0]['accuracy']==result['accuracy']
+    assert result['candidates'][0]['score_components']['contents']==98
+    assert 'online title agreement' in result['reason']
+    assert author_score('William Shakespeare','Will Shakespeare')>.9
+    assert author_score('Jane Austen','Jane Marie Austen')>.9
+    assert title_score('A Tale of Two Cities: A Novel','A Tale of Two Cities')>=.94
+    exact=choose_match(dict(title='Pride and Prejudice',author='Jane Austen',strength=.98,isbn=''),[candidate()])
+    assert exact['accuracy']==100 and exact['match']
+
+
+def test_weak_filename_or_conflicting_author_never_crosses_auto_threshold():
+    weak=dict(title='Pride and Prejudice',author='',strength=.35,isbn='')
+    result=choose_match(weak,[candidate()])
+    assert result['match'] is None and result['accuracy']<80
+    conflict=dict(title='Pride and Prejudice',author='John Austen',strength=.98,isbn='')
+    result=choose_match(conflict,[candidate()])
+    assert result['match'] is None and result['accuracy']<80
+
+
+def test_candidates_are_ranked_and_exact_isbn_scores_one_hundred_percent():
+    evidence=dict(title='Pride and Prejudice',author='Jane Austen',strength=.98,isbn='0141439513')
+    result=choose_match(evidence,[candidate(title='Pride and Prejuduce',key='OL2W'),candidate(isbns=['9780141439518'])])
+    assert result['match']['source'].endswith('OL66554W')
+    assert result['accuracy']==100 and result['candidates'][0]['accuracy']==100
+    conflict=choose_match(evidence,[candidate(title='Sense and Sensibility',isbns=['9780141439518'])])
+    assert conflict['match'] is None and conflict['accuracy']<80
 
 
 def test_exact_verified_isbn_can_identify_book_without_clear_title():

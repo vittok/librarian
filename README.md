@@ -171,11 +171,11 @@ Batch destinations accept the same locations. Copying, moving, organizing, and c
 
 ### Operations
 
-- **Convert** creates one or several output formats per selected source. Outputs already matching the source format are skipped. Successful outputs are indexed and inherit catalogue metadata. Originals are kept. A failed conversion is reported per file; other conversions continue. Each conversion has a ten-minute timeout.
+- **Convert** creates one or several output formats per selected source. Each converted file is named `Author - Title.format` using its catalogue metadata and the extension for the selected output format; missing authors use `Unknown author`. Unsafe filename characters are replaced. Outputs already matching the source format are skipped. Successful outputs are indexed and inherit catalogue metadata. Originals are kept. A failed conversion is reported per file; other conversions continue. Each conversion has a ten-minute timeout.
 - **Copy** keeps the original filename and source file, and indexes the destination.
 - **Move** copies and indexes the destination before removing the source, then removes the source's catalogue entry. If indexing or verification fails, the source is retained. The operation is **not an undoable transaction**. If a crash or disk failure occurs between steps, both copies may remain. Review the log and scan affected folders before retrying interrupted jobs.
 - **Organize** uses `Author / Title / Title.format` under your destination folder. Choose copy or move. Invalid filename characters are replaced, and metadata cannot escape the destination directory. Empty source folders are left in place.
-- Filename collisions get numbered names such as `Title (2).epub`. A file appearing after preview causes that operation to fail instead of overwriting it. Source changes after preview are also rejected. Batch jobs may partially succeed; the log records each outcome.
+- Filename collisions get numbered names such as `Author - Title (2).epub`. A file appearing after preview causes that operation to fail instead of overwriting it. Source changes after preview are also rejected. Batch jobs may partially succeed; the log records each outcome.
 
 Catalogue metadata changes do not modify original book files. Convert embeds the current title and author into the new output when the format supports them. Copy and Move preserve the original file bytes. Rescans retain manually edited or online-applied metadata.
 

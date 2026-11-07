@@ -118,13 +118,28 @@ def test_conversion_multi_format_and_failure(library,tmp_path):
     converter.write_text(f'#!{sys.executable}\nimport pathlib,sys\np=pathlib.Path(sys.argv[2])\nif p.suffix==".pdf": sys.stderr.write("PDF failed");sys.exit(1)\np.write_text("converted book")\n')
     converter.chmod(0o755); library.converter=str(converter)
     source=make_book(tmp_path/'in'); bid=library.index_file(source)
+    library.update_metadata(bid,dict(title='The Book: Revised',author='A/Writer'))
     plan=library.plan(dict(kind='convert',ids=[bid],formats=['txt','epub','pdf'],destination=str(tmp_path/'out')))
     assert len(plan['entries'])==2
+    assert Path(plan['entries'][0]['target']).name=='A_Writer - The Book_ Revised.epub'
+    assert Path(plan['entries'][1]['target']).name=='A_Writer - The Book_ Revised.pdf'
     job=wait_job(library,library.execute(plan['plan_id'])['job_id'])
     assert job['done']==2 and job['errors']==1
-    assert source.exists() and (tmp_path/'out'/'Book.epub').exists()
-    assert not (tmp_path/'out'/'Book.pdf').exists()
+    assert source.exists() and (tmp_path/'out'/'A_Writer - The Book_ Revised.epub').exists()
+    assert not (tmp_path/'out'/'A_Writer - The Book_ Revised.pdf').exists()
     assert not list((tmp_path/'out').glob('.bookroom-*'))
+
+
+def test_conversion_name_includes_unknown_author_and_collision_number(library,tmp_path):
+    import sys
+    converter=tmp_path/'converter'
+    converter.write_text(f'#!{sys.executable}\nimport pathlib,sys\npathlib.Path(sys.argv[2]).write_text("converted")\n')
+    converter.chmod(0o755); library.converter=str(converter)
+    source=make_book(tmp_path/'in'); bid=library.index_file(source)
+    output=tmp_path/'out'; output.mkdir()
+    (output/'Unknown author - Book.epub').write_text('keep')
+    plan=library.plan(dict(kind='convert',ids=[bid],formats=['epub'],destination=str(output)))
+    assert Path(plan['entries'][0]['target']).name=='Unknown author - Book (2).epub'
 
 
 def test_metadata_lookup_mocked_response(library,monkeypatch):
@@ -183,13 +198,13 @@ def test_optional_real_calibre_smoke(library,tmp_path):
     assert job['done']==5
     assert source.is_file()
     output=tmp_path/'out'
-    assert (output/'A Little Atlas.pdf').read_bytes().startswith(b'%PDF')
-    title,author,body,status=extract(output/'A Little Atlas.epub')
+    assert (output/'Example Author - A Little Atlas.pdf').read_bytes().startswith(b'%PDF')
+    title,author,body,status=extract(output/'Example Author - A Little Atlas.epub')
     assert title=='A Little Atlas' and author=='Example Author'
     assert 'cartography' in body
     assert library.stats()['count']==6
     from bookroom.metadata import inspect_book
-    identified=inspect_book(output/'A Little Atlas.mobi',extract(output/'A Little Atlas.mobi'),converter)
+    identified=inspect_book(output/'Example Author - A Little Atlas.mobi',extract(output/'Example Author - A Little Atlas.mobi'),converter)
     assert identified['title']=='A Little Atlas' and identified['author']=='Example Author'
     mobi=next(b for b in library.catalogue()['books'] if b['format']=='mobi')
     preview=library.book_preview(mobi['id'])

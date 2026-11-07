@@ -59,6 +59,20 @@ def safe_name(value):
     return value or 'Unknown'
 
 
+def _filename_bytes(value, limit):
+    """Keep a filename component within common filesystem byte limits."""
+    raw = value.encode('utf-8')
+    if len(raw) <= limit: return value
+    return raw[:limit].decode('utf-8', 'ignore').rstrip(' .') or 'Unknown'
+
+
+def conversion_name(author, title):
+    """Build a portable Author - Title stem while leaving room for extension."""
+    author = _filename_bytes(safe_name(author or 'Unknown author'), 80)
+    title = _filename_bytes(safe_name(title), 130)
+    return f'{author} - {title}'
+
+
 def is_placeholder(path):
     """Author-index sidecars (and copies converted from them) are not books."""
     return Path(path).name.startswith('!')
@@ -494,7 +508,9 @@ class Library:
                 if kind=='convert' and fmt==book['format']: continue
                 target = destination
                 if kind=='organize': target = target / safe_name(book['author'] or 'Unknown author') / safe_name(book['title'])
-                name = safe_name(book['title']) if kind in {'organize','convert'} else safe_name(src.stem)
+                if kind=='convert': name = conversion_name(book['author'],book['title'])
+                elif kind=='organize': name = safe_name(book['title'])
+                else: name = safe_name(src.stem)
                 output = target / f'{name}.{fmt}'
                 serial = 2
                 while output.exists() or str(output) in reserved:

@@ -194,3 +194,22 @@ def test_optional_real_calibre_smoke(library,tmp_path):
     mobi=next(b for b in library.catalogue()['books'] if b['format']=='mobi')
     preview=library.book_preview(mobi['id'])
     assert 'cartography' in preview['text'] and preview['has_text']
+
+
+def test_scan_excludes_bang_prefixed_placeholders_but_keeps_small_books(library,tmp_path):
+    folder=tmp_path/'books'
+    make_book(folder,'! Author.txt','https://example.com/author')
+    make_book(folder,'! Author.epub','converted placeholder')
+    make_book(folder,'! Author.mobi','converted placeholder')
+    short=make_book(folder,'A short poem.txt','A short poem.')
+    job=wait_job(library,library.scan(str(folder))['job_id'])
+    assert job['status']=='completed' and job['total']==1 and job['errors']==0
+    assert library.catalogue()['total']==1
+    assert library.catalogue()['books'][0]['path']==str(short)
+    assert (folder/'! Author.txt').is_file()
+
+
+def test_direct_index_cannot_reintroduce_placeholder(library,tmp_path):
+    placeholder=make_book(tmp_path,'! Author.txt','link')
+    with pytest.raises(ValueError,match='beginning with !'):library.index_file(placeholder)
+    assert library.catalogue()['total']==0 and placeholder.read_text()=='link'

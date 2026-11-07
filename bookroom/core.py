@@ -59,6 +59,11 @@ def safe_name(value):
     return value or 'Unknown'
 
 
+def is_placeholder(path):
+    """Author-index sidecars (and copies converted from them) are not books."""
+    return Path(path).name.startswith('!')
+
+
 def digest(path):
     h = hashlib.sha256()
     with path.open('rb') as f:
@@ -244,6 +249,7 @@ class Library:
         return dict(count=count,size=size,indexed=indexed,duplicates=duplicates,review_count=review_count,formats=formats,roots=roots,converter=bool(self.converter),converter_error=self.converter_error,outputs=OUTPUTS,data_dir=str(self.data_dir))
 
     def index_file(self, path):
+        if is_placeholder(path):raise ValueError('Files with names beginning with ! are excluded from the book catalogue')
         path = Path(path).resolve()
         with self.db() as db: old = db.execute('SELECT * FROM books WHERE path=?',(str(path),)).fetchone()
         size, mtime = signature(path)
@@ -447,7 +453,7 @@ class Library:
                 dirs[:] = [d for d in dirs if not (Path(parent)/d).is_symlink() and (Path(parent)/d).resolve() != self.data_dir]
                 for name in files:
                     p = Path(parent)/name
-                    if not p.is_symlink() and p.suffix.lower()[1:] in INPUTS: paths.append(p)
+                    if not is_placeholder(p) and not p.is_symlink() and p.suffix.lower()[1:] in INPUTS: paths.append(p)
             if walk_errors and not paths:
                 raise ValueError('Cannot scan folder. Reconnect the network share and check read permissions. '+walk_errors[0])
             with self.db() as db: db.execute('UPDATE jobs SET total=? WHERE id=?',(len(paths),jid))

@@ -462,17 +462,21 @@ class Library:
             # Network checks run in the worker so import returns a queued job
             # without waiting for the OS to contact a slow/disconnected share.
             root = directory(location).resolve()
-            paths = []; walk_errors = []; scanned_ids=[]
+            paths = []; walk_errors = []; scanned_ids=[]; placeholders=0
             def onerror(e): walk_errors.append(str(e))
             for parent, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
                 dirs[:] = [d for d in dirs if not (Path(parent)/d).is_symlink() and (Path(parent)/d).resolve() != self.data_dir]
                 for name in files:
                     p = Path(parent)/name
-                    if not is_placeholder(p) and not p.is_symlink() and p.suffix.lower()[1:] in INPUTS: paths.append(p)
+                    if p.is_symlink() or p.suffix.lower()[1:] not in INPUTS:continue
+                    if is_placeholder(p):placeholders+=1
+                    else:paths.append(p)
             if walk_errors and not paths:
                 raise ValueError('Cannot scan folder. Reconnect the network share and check read permissions. '+walk_errors[0])
             with self.db() as db: db.execute('UPDATE jobs SET total=? WHERE id=?',(len(paths),jid))
             for error in walk_errors: self.progress(jid,'Folder unavailable; reconnect the share or check read permissions: '+error,True,False)
+            if placeholders:self.progress(jid,f'Skipped {placeholders} files beginning with ! because Bookroom treats them as non-book placeholders.',increment=False)
+            if not paths:self.progress(jid,'No eligible book files were found in this folder.',increment=False)
             for path in paths:
                 try: scanned_ids.append(self.index_file(path)); self.progress(jid, f'Indexed {path}')
                 except Exception as e: self.progress(jid,f'{path}: {e}',True)

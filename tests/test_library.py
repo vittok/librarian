@@ -219,9 +219,22 @@ def test_scan_excludes_bang_prefixed_placeholders_but_keeps_small_books(library,
     short=make_book(folder,'A short poem.txt','A short poem.')
     job=wait_job(library,library.scan(str(folder))['job_id'])
     assert job['status']=='completed' and job['total']==1 and job['errors']==0
+    assert any('Skipped 3 files beginning with !' in entry['message'] for entry in job['log'])
     assert library.catalogue()['total']==1
     assert library.catalogue()['books'][0]['path']==str(short)
     assert (folder/'! Author.txt').is_file()
+
+
+def test_all_placeholder_scan_finishes_with_explanatory_log(library,tmp_path):
+    folder=tmp_path/'books'
+    make_book(folder,'! Author.epub','converted placeholder')
+    make_book(folder,'! Author.mobi','converted placeholder')
+    job=wait_job(library,library.scan(str(folder))['job_id'])
+    assert job['status']=='completed' and job['total']==0 and job['done']==0 and job['errors']==0
+    messages=[entry['message'] for entry in job['log']]
+    assert any('Skipped 2 files beginning with !' in message for message in messages)
+    assert 'No eligible book files were found in this folder.' in messages
+    assert library.catalogue()['total']==0
 
 
 def test_direct_index_cannot_reintroduce_placeholder(library,tmp_path):

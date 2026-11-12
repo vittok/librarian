@@ -70,6 +70,28 @@ def test_html_and_docx_extraction_keep_title_page_boundaries(tmp_path):
     assert evidence['title']=='Pride and Prejudice' and evidence['author']=='Jane Austen'
 
 
+def test_localized_title_page_and_path_hypotheses(tmp_path):
+    folder=tmp_path/'Karel Čapek';folder.mkdir()
+    path=folder/'R.U.R.txt';path.write_text('Název: R.U.R.\nAutor: Karel Čapek\n\nKapitola první')
+    evidence=inspect_book(path,extract(path))
+    assert evidence['title']=='R.U.R.' and evidence['author']=='Karel Čapek'
+
+
+def test_parent_folder_can_corroborate_unlabelled_filename(tmp_path):
+    folder=tmp_path/'Jane Austen';folder.mkdir()
+    path=folder/'Pride and Prejudice.txt';path.write_text('Chapter One\nIt is a truth universally acknowledged.')
+    evidence=inspect_book(path,extract(path))
+    result=choose_match(evidence,[candidate()])
+    assert result['match'] and result['match']['score_components']['evidence_source']=='filename + parent folder'
+
+
+def test_organized_author_title_title_layout_uses_author_ancestor(tmp_path):
+    folder=tmp_path/'Jane Austen'/'Pride and Prejudice';folder.mkdir(parents=True)
+    path=folder/'Pride and Prejudice.txt';path.write_text('Chapter One')
+    evidence=inspect_book(path,extract(path))
+    assert any(h['title']=='Pride and Prejudice' and h['author']=='Jane Austen' for h in evidence['hypotheses'])
+
+
 def test_opening_text_alone_is_not_enough_to_auto_apply():
     evidence=title_page('Pride and Prejudice\nAn interesting sentence from the story.')
     evidence['isbn']=''
@@ -208,8 +230,44 @@ def test_lookup_cache_and_isbn_query_use_only_metadata(library,monkeypatch):
     monkeypatch.setattr(urllib.request,'urlopen',request)
     library.lookup('Pride and Prejudice','Jane Austen',isbn='9780141439518')
     library.lookup('Pride and Prejudice','Jane Austen',isbn='9780141439518')
-    assert len(calls)==1 and 'isbn%3A9780141439518' in calls[0]
+    assert len(calls)==2 and all('isbn%3A9780141439518' in url for url in calls)
+    assert any('googleapis.com/books' in url for url in calls)
+    assert any('openlibrary.org/search' in url for url in calls)
     assert 'file_123' not in calls[0]
+
+
+def test_google_results_are_merged_persisted_and_reused_offline(library,monkeypatch):
+    calls=[]
+    class Response:
+        def __init__(self,data):self.data=data
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def read(self,n):return json.dumps(self.data).encode()
+    def request(req,timeout):
+        calls.append(req.full_url)
+        if 'googleapis.com' in req.full_url:
+            return Response({'items':[{'id':'google-id','volumeInfo':{'title':'R.U.R.','authors':['Karel Čapek'],'publishedDate':'1920','language':'cs','industryIdentifiers':[{'type':'ISBN_13','identifier':'9780000000002'}]}}]})
+        return Response({'docs':[]})
+    monkeypatch.setattr(urllib.request,'urlopen',request)
+    first=library.lookup('R.U.R.','Karel Čapek')
+    assert first[0]['provider']=='google_books' and first[0]['language']=='cs'
+    monkeypatch.setattr(urllib.request,'urlopen',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('local reference should be used')))
+    second=library.lookup('R.U.R.','Karel Čapek')
+    assert second[0]['provider']=='google_books'
+    with library.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM reference_records').fetchone()[0]==1
+        assert db.execute('SELECT COUNT(*) FROM reference_search').fetchone()[0]==1
+
+
+def test_manual_confirmation_records_training_decision(library,tmp_path):
+    bid=book(library,tmp_path)
+    with library.db() as db:
+        db.execute('INSERT INTO metadata_reviews VALUES(?,?,?,?,?)',(bid,json.dumps({'title':'Pride and Prejudice'}),json.dumps([candidate()]),'review',time.time()))
+    library.update_metadata(bid,candidate())
+    with library.db() as db:
+        decision=db.execute('SELECT decision,automatic FROM match_decisions WHERE book_id=?',(bid,)).fetchone()
+        assert tuple(decision)==('accepted',0)
+        assert db.execute('SELECT COUNT(*) FROM reference_records').fetchone()[0]==1
 
 
 def test_library_snapshot_spans_pages_and_excludes_new_imports(library,tmp_path):

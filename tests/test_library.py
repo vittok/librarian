@@ -63,6 +63,14 @@ def test_epub_metadata_and_spine_text(tmp_path):
     assert 'constellation' in text and status=='Text indexed'
 
 
+def test_legacy_central_european_text_decoding(tmp_path):
+    path=tmp_path/'Česká kniha.txt'
+    path.write_bytes('Název: Příliš žluťoučký kůň\nAutor: Čestmír Říha'.encode('cp1250'))
+    title,author,text,status=extract(path)
+    assert 'Příliš žluťoučký kůň' in text
+    assert 'Čestmír Říha' in text and status=='Text indexed'
+
+
 def test_copy_preview_collisions_and_single_use(library,tmp_path):
     source=make_book(tmp_path/'in'); bid=library.index_file(source)
     out=tmp_path/'out'; out.mkdir(); (out/'Book.txt').write_text('keep')

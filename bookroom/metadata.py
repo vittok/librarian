@@ -9,6 +9,11 @@ import tempfile
 import unicodedata
 import xml.etree.ElementTree as ET
 
+try:
+    from rapidfuzz.fuzz import ratio as _rf_ratio, token_set_ratio as _rf_token_set_ratio
+except ImportError:  # Source checkouts still work before optional dependencies are installed.
+    _rf_ratio = _rf_token_set_ratio = None
+
 
 def normalized(value):
     return ' '.join(re.findall(r'\w+', ''.join(c for c in unicodedata.normalize('NFKD',str(value)).casefold() if not unicodedata.combining(c))))
@@ -53,13 +58,13 @@ def title_page(body):
     lines=[' '.join(line.split()).strip(' \t\ufeff') for line in body[:16000].splitlines() if line.strip()][:100]
     title='';author=''
     for line in lines:
-        match=re.match(r'^(?:Title|Book title)\s*:\s*(.+)',line,re.I)
+        match=re.match(r'^(?:Title|Book title|N[aá]zev|N[aá]zov|Titul|Nazwa)\s*:\s*(.+)',line,re.I)
         if match and useful_title(match[1]):title=match[1]
-        match=re.match(r'^(?:Author|Authors)\s*:\s*(.+)',line,re.I)
+        match=re.match(r'^(?:Author|Authors|Autor|Autorka|Napsal(?:a)?|Nap[ií]sal(?:a)?)\s*:\s*(.+)',line,re.I)
         if match and useful_author(match[1]):author=match[1]
     if title:return dict(title=title,author=author,source='labelled title page',strength=.98)
     for i,line in enumerate(lines[:40]):
-        match=re.match(r'^(?:by|written by)\s+(.{3,140})$',line,re.I)
+        match=re.match(r'^(?:by|written by|napsal(?:a)?|nap[ií]sal(?:a)?|autor(?:ka)?)\s+(.{3,140})$',line,re.I)
         if match and useful_author(match[1]):
             previous=[v for v in lines[max(0,i-3):i] if useful_title(v) and len(v.split())<=16 and not re.search(r'copyright|publisher|edition|gutenberg',v,re.I)]
             if previous:return dict(title=previous[-1],author=match[1],source='title page byline',strength=.94)
@@ -69,6 +74,50 @@ def title_page(body):
             candidates.append(line)
     if candidates:return dict(title=candidates[0],author='',source='opening text (needs corroboration)',strength=.55)
     return dict(title='',author='',source='no usable title page',strength=0)
+
+
+def _path_hypotheses(path):
+    """Return conservative title/author possibilities from filename ancestry."""
+    path=Path(path)
+    stem=re.sub(r'[_]+',' ',path.stem)
+    stem=re.sub(r'\s+',' ',stem).strip(' ._-')
+    generic={'books','book','ebooks','ebook','library','knihy','multimedia','documents','downloads','pdb','epub','pdf','mobi','prc','txt'}
+    parents=[]
+    for parent in path.parents[:3]:
+        name=re.sub(r'[_]+',' ',parent.name).strip(' ._-')
+        if useful_author(name) and normalized(name)!=normalized(stem) and normalized(name) not in generic and not re.fullmatch(r'\d{4}',name):parents.append(name)
+    result=[]
+    def add(title,author,source,strength):
+        if useful_title(title) and (not author or useful_author(author)):
+            item=dict(title=title.strip(' ._-'),author=author.strip(' ._-'),source=source,strength=strength)
+            key=(normalized(item['title']),normalized(item['author']))
+            if key not in {(normalized(v['title']),normalized(v['author'])) for v in result}:result.append(item)
+    for index,parent in enumerate(parents):add(stem,parent,'filename + parent folder',.78-index*.08)
+    parts=[v.strip() for v in re.split(r'\s+-\s+|\s+–\s+|\s+—\s+',stem,maxsplit=1)]
+    if len(parts)==2:
+        left,right=parts
+        parent=parents[0] if parents else ''
+        if parent:
+            left_author=max(author_score(left,parent),author_score(parent,left))
+            right_author=max(author_score(right,parent),author_score(parent,right))
+            if left_author>right_author:add(right,parent,'filename + parent folder',.84)
+            elif right_author>left_author:add(left,parent,'filename + parent folder',.84)
+        add(left,right,'filename pattern: title - author',.68)
+        add(right,left,'filename pattern: author - title',.64)
+    if not result:add(stem,'','filename',.35)
+    return result
+
+
+def _add_hypothesis(items,item):
+    if not useful_title(item.get('title','')):return
+    clean={k:item.get(k,'') for k in ('title','author','source','strength')}
+    clean['author']=clean['author'] if useful_author(clean['author']) else ''
+    clean['strength']=max(0,min(1,float(clean['strength'] or 0)))
+    key=(normalized(clean['title']),normalized(clean['author']))
+    old=next((v for v in items if (normalized(v['title']),normalized(v['author']))==key),None)
+    if old:
+        if clean['strength']>old['strength']:old.update(clean)
+    else:items.append(clean)
 
 
 def _calibre_metadata(path,converter):
@@ -94,10 +143,13 @@ def inspect_book(path,extracted,converter=None):
     page=title_page(body)
     embedded=useful_title(title) and (normalized(title)!=normalized(path.stem.replace('_',' ')) or useful_author(author))
     evidence=dict(title=title if useful_title(title) else '',author=author if useful_author(author) else '',source='embedded metadata' if embedded else 'filename',strength=.96 if embedded and useful_author(author) else .85 if embedded else .35,isbn=find_isbn(body))
+    hypotheses=[]
+    if embedded:_add_hypothesis(hypotheses,evidence)
     if not embedded or not evidence['author']:
         meta=_calibre_metadata(path,converter)
         if useful_title(meta.get('title','')) and (normalized(meta['title'])!=normalized(path.stem.replace('_',' ')) or useful_author(meta.get('author',''))):
             evidence.update(title=meta['title'],author=meta.get('author','') if useful_author(meta.get('author','')) else '',source='embedded metadata (Calibre)',strength=.96 if useful_author(meta.get('author','')) else .85)
+            _add_hypothesis(hypotheses,evidence)
         evidence['isbn']=evidence['isbn'] or meta.get('isbn','')
     if not body.strip() and converter and page['strength']==0 and evidence['strength']<.9:
         try:
@@ -109,9 +161,13 @@ def inspect_book(path,extracted,converter=None):
                     page=title_page(body);evidence['isbn']=evidence['isbn'] or find_isbn(body)
         except (OSError,subprocess.SubprocessError):pass
     # Explicit title-page fields/bylines outrank stale or missing embedded data.
+    _add_hypothesis(hypotheses,page)
+    for item in _path_hypotheses(path):_add_hypothesis(hypotheses,item)
     if page['strength']>=.9 or page['strength']>evidence['strength']:
         evidence.update(page)
+    if not evidence.get('title') and hypotheses:evidence.update(hypotheses[0])
     evidence['title']=evidence['title'][:1000];evidence['author']=evidence['author'][:1000]
+    evidence['hypotheses']=sorted(hypotheses,key=lambda v:v['strength'],reverse=True)[:10]
     return evidence
 
 
@@ -121,16 +177,22 @@ def title_score(left,right):
     if left==right:return 1.0
     # Different volume numbers should never be treated as near-identical titles.
     if re.findall(r'\b(?:\d+|i{1,3}|iv|vi{0,3}|ix|x)\b',left)!=re.findall(r'\b(?:\d+|i{1,3}|iv|vi{0,3}|ix|x)\b',right):return 0
-    sequence=SequenceMatcher(None,left,right).ratio()
+    sequence=(_rf_ratio(left,right)/100) if _rf_ratio else SequenceMatcher(None,left,right).ratio()
     a=[v for v in left.split() if v not in {'a','an','the'}]
     b=[v for v in right.split() if v not in {'a','an','the'}]
     aset,bset=set(a),set(b)
     token_dice=2*len(aset&bset)/(len(aset)+len(bset)) if aset and bset else 0
+    token_set=(_rf_token_set_ratio(left,right)/100) if _rf_token_set_ratio else token_dice
+    def trigrams(value):
+        padded='  '+value+'  '
+        return {padded[i:i+3] for i in range(max(0,len(padded)-2))}
+    ta,tb=trigrams(left),trigrams(right)
+    trigram=2*len(ta&tb)/(len(ta)+len(tb)) if ta and tb else 0
     # A subtitle or edition phrase may be absent on one source. Requiring at
     # least two shared words avoids treating single-word series titles as the
     # same book merely because one contains the other.
     containment=.94 if min(len(aset),len(bset))>=2 and (aset<=bset or bset<=aset) else 0
-    return min(1,max(sequence,token_dice*.98,containment))
+    return min(1,max(sequence,token_dice*.98,token_set*.96,trigram*.94,containment))
 
 
 def author_score(left,right):
@@ -157,15 +219,22 @@ def author_score(left,right):
 
 def match_score(evidence,candidate):
     """Return an explainable 0..1 accuracy score for an online candidate."""
-    title=title_score(evidence.get('title',''),candidate.get('title',''))
-    has_author=bool(evidence.get('author'))
-    author=author_score(evidence['author'],candidate.get('author','')) if has_author else 0
-    strength=max(0,min(1,float(evidence.get('strength',0))))
+    hypotheses=evidence.get('hypotheses') or [evidence]
+    ranked=[]
+    for item in hypotheses:
+        item_title=title_score(item.get('title',''),candidate.get('title',''))
+        item_has_author=bool(item.get('author'))
+        item_author=author_score(item['author'],candidate.get('author','')) if item_has_author else 0
+        item_strength=max(0,min(1,float(item.get('strength',0))))
+        if item_has_author:item_score=.45*item_strength+.40*item_title+.15*item_author
+        else:item_score=.45*item_strength+.55*item_title
+        ranked.append((item_score,item_title,item_author,item_strength,item_has_author,item))
+    _,title,author,strength,has_author,used=max(ranked,key=lambda v:v[0])
     exact_isbn=bool(evidence.get('isbn') and isbn13(evidence['isbn']) in {isbn13(v) for v in candidate.get('isbns',[]) if valid_isbn(v)})
     verified_isbn=exact_isbn and (strength<.85 or title>=.75)
     if verified_isbn:
         score=1.0
-    elif strength>=.95 and title==1 and (not has_author or author==1):
+    elif strength>=.95 and title==1 and (not has_author or author>=.98):
         score=1.0
     elif has_author:
         score=.45*strength+.40*title+.15*author
@@ -176,11 +245,11 @@ def match_score(evidence,candidate):
     if not verified_isbn and (title<.70 or (has_author and author==0)):score=min(score,.799)
     score=max(0,min(1,score))
     accuracy=int(score*100+1e-9)
-    parts={'contents':round(strength*100),'online_title':round(title*100),'author':round(author*100) if has_author else None,'isbn':verified_isbn}
+    parts={'contents':round(strength*100),'online_title':round(title*100),'author':round(author*100) if has_author else None,'isbn':verified_isbn,'evidence_source':used.get('source','')}
     if verified_isbn:reason='100% accuracy: verified ISBN match'
     elif score==1:reason='100% accuracy: inside-book title and internet title agree exactly'+(' and the author agrees' if has_author else '')
     else:
-        details=f"inside-book evidence {parts['contents']}%, online title agreement {parts['online_title']}%"
+        details=f"{parts['evidence_source'] or 'inside-book'} evidence {parts['contents']}%, online title agreement {parts['online_title']}%"
         if has_author:details+=f", author agreement {parts['author']}%"
         reason=f'{accuracy}% accuracy: {details}'
     return score,accuracy,parts,reason
@@ -200,6 +269,10 @@ def choose_match(evidence,candidates):
     if not ranked:return dict(match=None,candidates=[],score=0,accuracy=0,reason='No usable internet matches were found')
     best=ranked[0]
     if best[0]<.80:return dict(match=None,candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=best[2]+'; below the 80% automatic threshold')
-    if len(ranked)>1 and ranked[1][0]>=.80 and (ranked[1][0]==1 or (best[0]<1 and best[0]-ranked[1][0]<.04)):
+    exact_isbn_winner=bool(best[1]['score_components'].get('isbn'))
+    if not exact_isbn_winner and len(ranked)>1 and ranked[1][0]>=.80 and (ranked[1][0]==1 or best[0]-ranked[1][0]<.06):
         return dict(match=None,candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=f"{best[1]['accuracy']}% best accuracy, but several candidates are equally plausible; review required")
+    components=best[1]['score_components']
+    if not components['isbn'] and components['contents']<.75*100:
+        return dict(match=None,candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=best[2]+'; evidence source is too weak for an automatic update')
     return dict(match=best[1],candidates=scored,score=best[0],accuracy=best[1]['accuracy'],reason=best[2]+'; applied automatically')

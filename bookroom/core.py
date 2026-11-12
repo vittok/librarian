@@ -30,6 +30,31 @@ OUTPUTS = 'epub pdf azw3 mobi docx txt fb2 rtf htmlz kepub lit lrf pdb pmlz rb s
 TEXT_LIMIT = 2_000_000
 
 
+def decode_book_text(raw):
+    """Decode text while favouring Central European legacy encodings."""
+    if raw.startswith((b'\xff\xfe',b'\xfe\xff')):
+        return raw.decode('utf-16','replace')
+    try:return raw.decode('utf-8')
+    except UnicodeDecodeError:pass
+    candidates=[]
+    for encoding in ('cp1250','iso-8859-2','cp1252'):
+        text=raw.decode(encoding,'replace')
+        replacements=text.count('\ufffd')
+        controls=sum(1 for c in text if ord(c)<32 and c not in '\n\r\t')
+        central=sum(text.count(c) for c in 'áčďéěíľĺňóôřŕšťúůýžÁČĎÉĚÍĽĹŇÓÔŘŔŠŤÚŮÝŽ')
+        candidates.append((replacements*100+controls-central*.05,text))
+    return min(candidates,key=lambda v:v[0])[1]
+
+
+def io_retry(operation, attempts=3):
+    """Retry transient network-filesystem reads without hiding final failures."""
+    for attempt in range(attempts):
+        try:return operation()
+        except OSError:
+            if attempt+1==attempts:raise
+            time.sleep(.25*(2**attempt))
+
+
 class TextHTML(HTMLParser):
     def __init__(self):
         super().__init__(); self.parts = []; self.hidden = 0
@@ -96,7 +121,7 @@ def extract(path, text_limit=TEXT_LIMIT, pdf_pages=1000):
     try:
         if ext in {'txt', 'html', 'htm', 'pml'}:
             raw = path.open('rb')
-            with raw: body = raw.read(text_limit * 2).decode('utf-8', errors='replace')
+            with raw: body = decode_book_text(raw.read(text_limit * 2))
             if ext in {'html', 'htm'}: body = plain_html(body)
         elif ext == 'fb2':
             with path.open('rb') as f: root = ET.fromstring(f.read(16_000_000))
@@ -130,7 +155,7 @@ def extract(path, text_limit=TEXT_LIMIT, pdf_pages=1000):
                 else: selected = [n for n in names if n.lower().endswith(('.txt', '.html', '.htm', '.xhtml', '.fb2'))]
                 parts = []; length = 0
                 for name in selected:
-                    raw = z.read(name).decode('utf-8', errors='replace')
+                    raw = decode_book_text(z.read(name))
                     text = raw if name.endswith('.txt') else (xml_text(raw) if name.endswith(('.xml', '.fb2')) else plain_html(raw))
                     parts.append(text[:text_limit-length]); length += len(parts[-1])
                     if length >= text_limit: break
@@ -152,10 +177,12 @@ def extract(path, text_limit=TEXT_LIMIT, pdf_pages=1000):
                     with tempfile.TemporaryDirectory() as folder:
                         out = Path(folder) / 'content.txt'
                         subprocess.run(['pdftotext', '-f', '1', '-l', str(pdf_pages), str(path), str(out)], check=True, capture_output=True, timeout=90)
-                        with out.open('rb') as f: body = f.read(text_limit*2).decode('utf-8', 'replace')
+                        with out.open('rb') as f: body = decode_book_text(f.read(text_limit*2))
                 else: status = 'Metadata only: install pypdf or pdftotext for PDF text'
         if body.strip(): status = 'Text indexed' + (' (truncated)' if len(body) >= text_limit else '')
         elif ext == 'pdf': status = 'Metadata only: no text extracted; scanned PDFs need OCR'
+    except OSError:
+        raise
     except Exception as e:
         status = f'Metadata only: extraction failed ({type(e).__name__})'
     return title[:1000], author[:1000], body[:text_limit], status
@@ -195,6 +222,24 @@ class Library:
                 CREATE TABLE IF NOT EXISTS metadata_cache(key TEXT PRIMARY KEY,data TEXT,created REAL);
                 CREATE TABLE IF NOT EXISTS metadata_reviews(book_id INTEGER PRIMARY KEY,evidence TEXT,candidates TEXT,reason TEXT,created REAL);
                 CREATE TABLE IF NOT EXISTS metadata_history(id INTEGER PRIMARY KEY,job_id TEXT,book_id INTEGER,previous TEXT,applied TEXT,undone INTEGER DEFAULT 0,created REAL);
+                CREATE TABLE IF NOT EXISTS reference_records(
+                    id INTEGER PRIMARY KEY,provider TEXT NOT NULL,provider_id TEXT NOT NULL,title TEXT NOT NULL,
+                    author TEXT DEFAULT '',year TEXT DEFAULT '',source TEXT DEFAULT '',isbns TEXT DEFAULT '[]',
+                    language TEXT DEFAULT '',series TEXT DEFAULT '',created REAL,updated REAL,
+                    UNIQUE(provider,provider_id));
+                CREATE TABLE IF NOT EXISTS reference_titles(record_id INTEGER,title TEXT,normalized TEXT,
+                    kind TEXT DEFAULT 'canonical',language TEXT DEFAULT '',UNIQUE(record_id,normalized));
+                CREATE TABLE IF NOT EXISTS reference_authors(record_id INTEGER,author TEXT,normalized TEXT,
+                    kind TEXT DEFAULT 'canonical',UNIQUE(record_id,normalized));
+                CREATE TABLE IF NOT EXISTS reference_isbns(record_id INTEGER,isbn TEXT,UNIQUE(record_id,isbn));
+                CREATE VIRTUAL TABLE IF NOT EXISTS reference_search USING fts5(
+                    record_id UNINDEXED,title,author,tokenize='unicode61 remove_diacritics 2');
+                CREATE TABLE IF NOT EXISTS match_decisions(
+                    id INTEGER PRIMARY KEY,book_id INTEGER,evidence TEXT,candidate TEXT,decision TEXT NOT NULL,
+                    automatic INTEGER DEFAULT 0,created REAL);
+                CREATE INDEX IF NOT EXISTS reference_isbn_provider ON reference_records(provider,provider_id);
+                CREATE INDEX IF NOT EXISTS reference_isbn_value ON reference_isbns(isbn);
+                CREATE INDEX IF NOT EXISTS match_decisions_book ON match_decisions(book_id,created);
 
             ''')
             if 'location' not in {row[1] for row in db.execute('PRAGMA table_info(roots)')}:
@@ -266,11 +311,11 @@ class Library:
         if is_placeholder(path):raise ValueError('Files with names beginning with ! are excluded from the book catalogue')
         path = Path(path).resolve()
         with self.db() as db: old = db.execute('SELECT * FROM books WHERE path=?',(str(path),)).fetchone()
-        size, mtime = signature(path)
+        size, mtime = io_retry(lambda:signature(path))
         if old and old['size']==size and old['mtime']==mtime: return old['id']
-        sha = digest(path)
-        title, author, body, status = extract(path)
-        if signature(path) != [size, mtime]: raise ValueError('File changed during indexing; scan again')
+        sha = io_retry(lambda:digest(path))
+        title, author, body, status = io_retry(lambda:extract(path))
+        if io_retry(lambda:signature(path)) != [size, mtime]: raise ValueError('File changed during indexing; scan again')
         if old and old['metadata_locked']: title, author = old['title'], old['author']
         with self.db() as db:
             db.execute('''INSERT INTO books(path,title,author,format,size,mtime,sha256,body,index_status,added)
@@ -287,38 +332,117 @@ class Library:
         author = str(values.get('author','')).strip()[:1000]
         year = str(values.get('year','')).strip()[:20]
         source = str(values.get('source',''))[:300]
-        if source and not re.fullmatch(r'https://openlibrary\.org/works/OL\d+W', source): source = ''
+        if source and not (re.fullmatch(r'https://openlibrary\.org/works/OL\d+W',source) or re.fullmatch(r'https://books\.google\.[^/]+/books\?id=[\w-]+',source)): source = ''
         with self.db() as db:
+            review=db.execute('SELECT evidence,candidates FROM metadata_reviews WHERE book_id=?',(book_id,)).fetchone()
             db.execute("UPDATE books SET title=?,author=?,year=?,source=?,metadata_locked=1,metadata_origin='manual' WHERE id=?",(title,author,year,source,book_id))
+            candidate={**values,'title':title,'author':author,'year':year,'source':source}
+            db.execute('INSERT INTO match_decisions(book_id,evidence,candidate,decision,automatic,created) VALUES(?,?,?,?,0,?)',
+                (book_id,review['evidence'] if review else '{}',json.dumps(candidate), 'accepted',time.time()))
             db.execute('DELETE FROM metadata_reviews WHERE book_id=?',(book_id,))
+        self._store_reference({**candidate,'provider':str(values.get('provider','confirmed')),'provider_id':str(values.get('provider_id','')) or f'book-{book_id}'},fallback_provider='confirmed')
         return {'ok':True}
+
+    def _store_reference(self, candidate, fallback_provider='internet'):
+        title=str(candidate.get('title','')).strip()[:1000]
+        if not title:return
+        author=str(candidate.get('author','')).strip()[:1000]
+        provider=str(candidate.get('provider') or fallback_provider)[:40]
+        provider_id=str(candidate.get('provider_id') or candidate.get('source') or f'{normalized(title)}|{normalized(author)}')[:500]
+        isbns=sorted({isbn13(v) for v in candidate.get('isbns',[]) if valid_isbn(v)})
+        now=time.time()
+        with self.db() as db:
+            db.execute('''INSERT INTO reference_records(provider,provider_id,title,author,year,source,isbns,language,series,created,updated)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,provider_id) DO UPDATE SET
+                title=excluded.title,author=excluded.author,year=excluded.year,source=excluded.source,
+                isbns=excluded.isbns,language=excluded.language,series=excluded.series,updated=excluded.updated''',
+                (provider,provider_id,title,author,str(candidate.get('year',''))[:20],str(candidate.get('source',''))[:500],json.dumps(isbns),str(candidate.get('language',''))[:30],str(candidate.get('series',''))[:300],now,now))
+            rid=db.execute('SELECT id FROM reference_records WHERE provider=? AND provider_id=?',(provider,provider_id)).fetchone()[0]
+            db.execute('INSERT OR IGNORE INTO reference_titles VALUES(?,?,?,?,?)',(rid,title,normalized(title),'canonical',str(candidate.get('language',''))[:30]))
+            if author:db.execute('INSERT OR IGNORE INTO reference_authors VALUES(?,?,?,?)',(rid,author,normalized(author),'canonical'))
+            for alias in candidate.get('title_aliases',[]):
+                if str(alias).strip():db.execute('INSERT OR IGNORE INTO reference_titles VALUES(?,?,?,?,?)',(rid,str(alias)[:1000],normalized(alias),'alias',''))
+            for alias in candidate.get('author_aliases',[]):
+                if str(alias).strip():db.execute('INSERT OR IGNORE INTO reference_authors VALUES(?,?,?,?)',(rid,str(alias)[:1000],normalized(alias),'alias'))
+            for value in isbns:db.execute('INSERT OR IGNORE INTO reference_isbns VALUES(?,?)',(rid,value))
+            db.execute('DELETE FROM reference_search WHERE record_id=?',(rid,))
+            titles=' '.join(r[0] for r in db.execute('SELECT title FROM reference_titles WHERE record_id=?',(rid,)))
+            authors=' '.join(r[0] for r in db.execute('SELECT author FROM reference_authors WHERE record_id=?',(rid,)))
+            db.execute('INSERT INTO reference_search(record_id,title,author) VALUES(?,?,?)',(rid,titles,authors))
+
+    def _local_lookup(self,title='',author='',isbn=''):
+        with self.db() as db:
+            if isbn:
+                rows=db.execute('SELECT DISTINCT r.* FROM reference_records r JOIN reference_isbns i ON i.record_id=r.id WHERE i.isbn=? LIMIT 20',(isbn13(isbn),)).fetchall()
+            else:
+                words=re.findall(r'\w+',normalized(title))[:12]
+                if not words:return []
+                query=' AND '.join('"'+w+'"*' for w in words)
+                rows=db.execute('SELECT r.* FROM reference_search s JOIN reference_records r ON r.id=s.record_id WHERE reference_search MATCH ? LIMIT 20',(query,)).fetchall()
+                if not rows and len(words)>1:
+                    query=' OR '.join('"'+w+'"*' for w in words)
+                    rows=db.execute('SELECT r.* FROM reference_search s JOIN reference_records r ON r.id=s.record_id WHERE reference_search MATCH ? ORDER BY rank LIMIT 20',(query,)).fetchall()
+        return [{**dict(r),'isbns':json.loads(r['isbns'] or '[]'),'provider_id':r['provider_id']} for r in rows]
+
+    def _fetch_json(self,url,provider):
+        req=urllib.request.Request(url,headers={'User-Agent':'Bookroom/1.1 (local personal library manager)','Accept':'application/json'})
+        try:
+            with urllib.request.urlopen(req,timeout=25) as response:return json.loads(response.read(2_000_000))
+        except Exception as e:raise ValueError(f'{provider} could not be reached: {e}') from e
+
+    def _openlibrary_lookup(self,title,author,isbn):
+        query={'limit':12,'fields':'key,title,author_name,first_publish_year,isbn,language'}
+        if isbn:query['q']='isbn:'+isbn
+        else:
+            query['title']=title[:250]
+            if author:query['author']=author[:250]
+        data=self._fetch_json('https://openlibrary.org/search.json?'+urllib.parse.urlencode(query),'Open Library')
+        result=[]
+        for item in data.get('docs',[]):
+            work=str(item.get('key',''));work='/works/'+work if work.startswith('OL') else work
+            if not re.fullmatch(r'/works/OL\d+W',work):continue
+            result.append(dict(title=str(item.get('title','')),author='; '.join(item.get('author_name',[])),year=str(item.get('first_publish_year','')),source='https://openlibrary.org'+work,isbns=[valid_isbn(v) for v in item.get('isbn',[]) if valid_isbn(v)][:12],language=';'.join(item.get('language',[])[:3]),provider='openlibrary',provider_id=work))
+        return result
+
+    def _google_lookup(self,title,author,isbn):
+        terms=['isbn:'+isbn] if isbn else (['intitle:'+title[:220]]+(['inauthor:'+author[:160]] if author else []))
+        query={'q':' '.join(terms),'maxResults':20,'printType':'books','projection':'lite'}
+        if os.environ.get('GOOGLE_BOOKS_API_KEY'):query['key']=os.environ['GOOGLE_BOOKS_API_KEY']
+        data=self._fetch_json('https://www.googleapis.com/books/v1/volumes?'+urllib.parse.urlencode(query),'Google Books')
+        result=[]
+        for item in data.get('items',[]):
+            info=item.get('volumeInfo') or {};gid=str(item.get('id',''))
+            if not gid or not info.get('title'):continue
+            identifiers=[valid_isbn(v.get('identifier','')) for v in info.get('industryIdentifiers',[]) if valid_isbn(v.get('identifier',''))]
+            result.append(dict(title=str(info.get('title','')),author='; '.join(info.get('authors',[])),year=str(info.get('publishedDate',''))[:4],source='https://books.google.com/books?id='+gid,isbns=identifiers,language=str(info.get('language','')),provider='google_books',provider_id=gid))
+        return result
 
     def lookup(self, title='', author='', isbn=''):
         isbn=valid_isbn(isbn)
-        key=json.dumps([normalized(title),normalized(author),isbn],ensure_ascii=False)
+        key='v2:'+json.dumps([normalized(title),normalized(author),isbn],ensure_ascii=False)
         with self.metadata_lock:
-            with self.db() as db:
-                cached=db.execute('SELECT data FROM metadata_cache WHERE key=? AND created>?',(key,time.time()-7*86400)).fetchone()
-            if cached:return json.loads(cached[0])
-            time.sleep(max(0, 1.1 - (time.monotonic() - self.last_lookup)))
-            self.last_lookup = time.monotonic()
-            query = {'limit':8,'fields':'key,title,author_name,first_publish_year'+(',isbn' if isbn else '')}
-            if isbn:query['q']='isbn:'+isbn
-            else:
-                query['title']=title[:250]
-                if author:query['author']=author[:250]
-            url='https://openlibrary.org/search.json?'+urllib.parse.urlencode(query)
-            req=urllib.request.Request(url,headers={'User-Agent':'Bookroom/1.0 (local personal library manager)','Accept':'application/json'})
-            try:
-                with urllib.request.urlopen(req,timeout=25) as response:data=json.loads(response.read(2_000_000))
-            except Exception as e:raise ValueError(f'Open Library could not be reached: {e}') from e
-            result=[]
-            for item in data.get('docs',[]):
-                work=str(item.get('key',''));work='/works/'+work if work.startswith('OL') else work
-                if not re.fullmatch(r'/works/OL\d+W',work):continue
-                result.append(dict(title=str(item.get('title','')),author='; '.join(item.get('author_name',[])),year=str(item.get('first_publish_year','')),source='https://openlibrary.org'+work,isbns=[v for v in item.get('isbn',[]) if valid_isbn(v) and (not isbn or isbn13(v)==isbn13(isbn))][:4]))
-            with self.db() as db:db.execute('INSERT OR REPLACE INTO metadata_cache VALUES(?,?,?)',(key,json.dumps(result),time.time()))
-            return result
+            local=self._local_lookup(title,author,isbn)
+            if local and (isbn or any(normalized(c.get('title',''))==normalized(title) and (not author or normalized(c.get('author',''))==normalized(author)) for c in local)):
+                return local[:30]
+            with self.db() as db:cached=db.execute('SELECT data FROM metadata_cache WHERE key=? AND created>?',(key,time.time()-14*86400)).fetchone()
+            online=json.loads(cached[0]) if cached else None
+            if online is None:
+                online=[];errors=[]
+                for provider in (self._google_lookup,self._openlibrary_lookup):
+                    try:
+                        time.sleep(max(0,.55-(time.monotonic()-self.last_lookup)));self.last_lookup=time.monotonic()
+                        found=provider(title,author,isbn);online.extend(found)
+                        if isbn and any(isbn13(isbn) in {isbn13(v) for v in c.get('isbns',[]) if valid_isbn(v)} for c in found):break
+                    except ValueError as e:errors.append(str(e))
+                if not online and errors and not local:raise ValueError('; '.join(errors))
+                with self.db() as db:db.execute('INSERT OR REPLACE INTO metadata_cache VALUES(?,?,?)',(key,json.dumps(online),time.time()))
+                for candidate in online:self._store_reference(candidate)
+            merged=[];seen=set()
+            for candidate in local+online:
+                key2=(normalized(candidate.get('title','')),normalized(candidate.get('author','')))
+                if not key2[0] or key2 in seen:continue
+                seen.add(key2);merged.append(candidate)
+            return merged[:30]
 
     def _check_selection(self, db, selection_id):
         row=db.execute('SELECT created FROM selections WHERE id=?',(selection_id,)).fetchone()
@@ -358,13 +482,27 @@ class Library:
 
     def identify_book(self, book_id):
         book=self.get(book_id);path=Path(book['path'])
-        before=signature(path)
+        before=io_retry(lambda:signature(path))
         if before!=[book['size'],book['mtime']]:raise ValueError('Book changed since indexing; rescan before identifying it')
-        evidence=inspect_book(path,extract(path,text_limit=120000,pdf_pages=12),self.converter)
-        if signature(path)!=before:raise ValueError('Book changed during inspection; rescan it')
+        evidence=io_retry(lambda:inspect_book(path,extract(path,text_limit=160000,pdf_pages=16),self.converter))
+        if io_retry(lambda:signature(path))!=before:raise ValueError('Book changed during inspection; rescan it')
         if not evidence['title'] and not evidence['isbn']:return dict(evidence=evidence,candidates=[],match=None,score=0,accuracy=0,reason='No usable text or embedded metadata; image-only books need OCR')
-        candidates=self.lookup(evidence['title'],evidence['author'],isbn=evidence['isbn'])
-        if evidence['isbn'] and not candidates:candidates=self.lookup(evidence['title'],evidence['author']) if evidence['title'] else []
+        candidates=[];seen=set()
+        queries=[]
+        if evidence['isbn']:queries.append((evidence['title'],evidence['author'],evidence['isbn']))
+        for item in evidence.get('hypotheses',[]):
+            query=(item.get('title',''),item.get('author',''),'')
+            if query[0] and (normalized(query[0]),normalized(query[1])) not in {(normalized(v[0]),normalized(v[1])) for v in queries}:queries.append(query)
+            if len(queries)>=2:break
+        if not queries and evidence['title']:queries.append((evidence['title'],evidence['author'],''))
+        for title,author,isbn in queries:
+            found=self.lookup(title,author,isbn=isbn)
+            for candidate in found:
+                key=(normalized(candidate.get('title','')),normalized(candidate.get('author','')))
+                if key not in seen:seen.add(key);candidates.append(candidate)
+            # A strong exact-ISBN result does not need several broad internet calls.
+            if isbn and any(isbn13(isbn) in {isbn13(v) for v in c.get('isbns',[]) if valid_isbn(v)} for c in found):break
+            if found and choose_match(evidence,candidates).get('match'):break
         result=choose_match(evidence,candidates)
         return dict(evidence=evidence,**result)
 
@@ -390,10 +528,12 @@ class Library:
                             after={k:match.get(k,'') for k in ('title','author','year','source')};after.update(metadata_locked=1,metadata_origin='automatic')
                             db.execute('INSERT INTO metadata_history(job_id,book_id,previous,applied,created) VALUES(?,?,?,?,?)',(jid,bid,json.dumps(before),json.dumps(after),time.time()))
                             db.execute("UPDATE books SET title=?,author=?,year=?,source=?,metadata_locked=1,metadata_origin='automatic' WHERE id=?",(after['title'],after['author'],after['year'],after['source'],bid))
+                            db.execute('INSERT INTO match_decisions(book_id,evidence,candidate,decision,automatic,created) VALUES(?,?,?,?,1,?)',(bid,json.dumps(identified['evidence']),json.dumps(match),'accepted',time.time()))
                             db.execute('DELETE FROM metadata_reviews WHERE book_id=?',(bid,))
                         else:
                             db.execute('INSERT OR REPLACE INTO metadata_reviews VALUES(?,?,?,?,?)',(bid,json.dumps(identified['evidence']),json.dumps(identified['candidates']),identified['reason'],time.time()))
                     message=f"Updated: {previous['title']} → {match['title']} — {match['author']} ({identified['reason']})" if match else f"Review needed: {previous['title']} ({identified['reason']})"
+                    if match:self._store_reference(match,fallback_provider='confirmed')
                     self.progress(jid,message)
                 except Exception as e:self.progress(jid,f'Book {bid}: {e}',True)
         return self.enqueue('Auto metadata',len(ids),task)

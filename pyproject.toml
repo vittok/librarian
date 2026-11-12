@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookroom-local"
-version = "1.1.0"
+version = "1.1.1"
 description = "A local Python ebook catalogue and batch conversion workshop"
 requires-python = ">=3.11"
 dependencies = ["rapidfuzz>=3.9,<4"]

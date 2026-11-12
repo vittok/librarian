@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -28,6 +29,12 @@ from .preview import Previews
 INPUTS = set('azw azw3 azw4 cbz cbr cb7 cbc chm djvu docx epub fb2 fbz html htm htmlz kepub lit lrf mobi odt pdf prc pdb pml rb rtf snb tcr txt txtz'.split())
 OUTPUTS = 'epub pdf azw3 mobi docx txt fb2 rtf htmlz kepub lit lrf pdb pmlz rb snb tcr txtz zip'.split()
 TEXT_LIMIT = 2_000_000
+
+
+class ProviderRateLimited(ValueError):
+    def __init__(self,provider,retry_after):
+        self.provider=provider;self.retry_after=retry_after
+        super().__init__(f'{provider} temporarily rate limited requests')
 
 
 def decode_book_text(raw):
@@ -220,6 +227,8 @@ class Library:
                 CREATE TABLE IF NOT EXISTS selections(id TEXT PRIMARY KEY, created REAL);
                 CREATE TABLE IF NOT EXISTS selection_books(selection_id TEXT,book_id INTEGER,PRIMARY KEY(selection_id,book_id));
                 CREATE TABLE IF NOT EXISTS metadata_cache(key TEXT PRIMARY KEY,data TEXT,created REAL);
+                CREATE TABLE IF NOT EXISTS metadata_provider_state(
+                    provider TEXT PRIMARY KEY,retry_after REAL DEFAULT 0,last_error TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS metadata_reviews(book_id INTEGER PRIMARY KEY,evidence TEXT,candidates TEXT,reason TEXT,created REAL);
                 CREATE TABLE IF NOT EXISTS metadata_history(id INTEGER PRIMARY KEY,job_id TEXT,book_id INTEGER,previous TEXT,applied TEXT,undone INTEGER DEFAULT 0,created REAL);
                 CREATE TABLE IF NOT EXISTS reference_records(
@@ -388,7 +397,22 @@ class Library:
         req=urllib.request.Request(url,headers={'User-Agent':'Bookroom/1.1 (local personal library manager)','Accept':'application/json'})
         try:
             with urllib.request.urlopen(req,timeout=25) as response:return json.loads(response.read(2_000_000))
+        except urllib.error.HTTPError as e:
+            if e.code==429:
+                try:retry=int(e.headers.get('Retry-After',''))
+                except (TypeError,ValueError):retry=6*3600
+                raise ProviderRateLimited(provider,min(86400,max(3600,retry))) from e
+            raise ValueError(f'{provider} could not be reached: HTTP Error {e.code}') from e
         except Exception as e:raise ValueError(f'{provider} could not be reached: {e}') from e
+
+    def _provider_ready(self,provider):
+        with self.db() as db:row=db.execute('SELECT retry_after FROM metadata_provider_state WHERE provider=?',(provider,)).fetchone()
+        return not row or row[0]<=time.time()
+
+    def _cooldown_provider(self,provider,seconds,message):
+        with self.db() as db:
+            db.execute('INSERT INTO metadata_provider_state VALUES(?,?,?) ON CONFLICT(provider) DO UPDATE SET retry_after=excluded.retry_after,last_error=excluded.last_error',
+                (provider,time.time()+seconds,str(message)[:500]))
 
     def _openlibrary_lookup(self,title,author,isbn):
         query={'limit':12,'fields':'key,title,author_name,first_publish_year,isbn,language'}
@@ -424,17 +448,25 @@ class Library:
             local=self._local_lookup(title,author,isbn)
             if local and (isbn or any(normalized(c.get('title',''))==normalized(title) and (not author or normalized(c.get('author',''))==normalized(author)) for c in local)):
                 return local[:30]
-            with self.db() as db:cached=db.execute('SELECT data FROM metadata_cache WHERE key=? AND created>?',(key,time.time()-14*86400)).fetchone()
-            online=json.loads(cached[0]) if cached else None
+            with self.db() as db:cached=db.execute('SELECT data,created FROM metadata_cache WHERE key=?',(key,)).fetchone()
+            online=None
+            if cached:
+                data=json.loads(cached['data']);ttl=14*86400 if data else 6*3600
+                if cached['created']>time.time()-ttl:online=data
             if online is None:
-                online=[];errors=[]
-                for provider in (self._google_lookup,self._openlibrary_lookup):
+                online=[];errors=[];successful=0
+                # Open Library is the lower-quota-cost primary source. Google
+                # Books is a fallback for titles it cannot find.
+                for provider_name,provider in (('openlibrary',self._openlibrary_lookup),('google_books',self._google_lookup)):
+                    if not self._provider_ready(provider_name):continue
                     try:
-                        time.sleep(max(0,.55-(time.monotonic()-self.last_lookup)));self.last_lookup=time.monotonic()
-                        found=provider(title,author,isbn);online.extend(found)
-                        if isbn and any(isbn13(isbn) in {isbn13(v) for v in c.get('isbns',[]) if valid_isbn(v)} for c in found):break
+                        time.sleep(max(0,1.1-(time.monotonic()-self.last_lookup)));self.last_lookup=time.monotonic()
+                        found=provider(title,author,isbn);successful+=1;online.extend(found)
+                        if found:break
+                    except ProviderRateLimited as e:
+                        self._cooldown_provider(provider_name,e.retry_after,e);errors.append(str(e))
                     except ValueError as e:errors.append(str(e))
-                if not online and errors and not local:raise ValueError('; '.join(errors))
+                if not online and successful==0 and errors and not local:raise ValueError('; '.join(errors))
                 with self.db() as db:db.execute('INSERT OR REPLACE INTO metadata_cache VALUES(?,?,?)',(key,json.dumps(online),time.time()))
                 for candidate in online:self._store_reference(candidate)
             merged=[];seen=set()

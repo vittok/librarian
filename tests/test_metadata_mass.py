@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import pytest
@@ -230,9 +231,8 @@ def test_lookup_cache_and_isbn_query_use_only_metadata(library,monkeypatch):
     monkeypatch.setattr(urllib.request,'urlopen',request)
     library.lookup('Pride and Prejudice','Jane Austen',isbn='9780141439518')
     library.lookup('Pride and Prejudice','Jane Austen',isbn='9780141439518')
-    assert len(calls)==2 and all('isbn%3A9780141439518' in url for url in calls)
-    assert any('googleapis.com/books' in url for url in calls)
-    assert any('openlibrary.org/search' in url for url in calls)
+    assert len(calls)==1 and 'isbn%3A9780141439518' in calls[0]
+    assert 'openlibrary.org/search' in calls[0]
     assert 'file_123' not in calls[0]
 
 
@@ -257,6 +257,27 @@ def test_google_results_are_merged_persisted_and_reused_offline(library,monkeypa
     with library.db() as db:
         assert db.execute('SELECT COUNT(*) FROM reference_records').fetchone()[0]==1
         assert db.execute('SELECT COUNT(*) FROM reference_search').fetchone()[0]==1
+
+
+def test_google_429_sets_persistent_cooldown_and_openlibrary_results_continue(library,monkeypatch):
+    calls=[]
+    class Response:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def read(self,n):return json.dumps({'docs':[]}).encode()
+    def request(req,timeout):
+        calls.append(req.full_url)
+        if 'googleapis.com' in req.full_url:
+            raise urllib.error.HTTPError(req.full_url,429,'Too Many Requests',{'Retry-After':'120'},None)
+        return Response()
+    monkeypatch.setattr(urllib.request,'urlopen',request)
+    assert library.lookup('Unlisted Czech Book','Example Author')==[]
+    first_google=sum('googleapis.com' in url for url in calls)
+    assert library.lookup('Another Unlisted Book','Example Author')==[]
+    assert sum('googleapis.com' in url for url in calls)==first_google==1
+    with library.db() as db:
+        state=db.execute("SELECT retry_after,last_error FROM metadata_provider_state WHERE provider='google_books'").fetchone()
+    assert state['retry_after']>time.time()+3500 and 'rate limited' in state['last_error']
 
 
 def test_manual_confirmation_records_training_decision(library,tmp_path):
